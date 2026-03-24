@@ -5,10 +5,10 @@ const VERCEL_API = "https://api.vercel.com";
 /**
  * git push 후 Vercel 배포가 완료될 때까지 폴링하고 프리뷰 URL을 반환한다.
  * @param {string} branchName - 배포된 브랜치명
- * @param {number} maxWait - 최대 대기 시간(ms), 기본 5분
+ * @param {number} maxWait - 최대 대기 시간(ms), 기본 3분
  * @returns {Promise<string|null>} 프리뷰 URL 또는 null
  */
-async function waitForVercelDeployment(branchName, maxWait = 300000) {
+async function waitForVercelDeployment(branchName, maxWait = 180000) {
   if (!CONFIG.vercel.token || !CONFIG.vercel.projectId) {
     console.log("[VERCEL] 토큰 또는 프로젝트 ID 미설정 — 프리뷰 URL 생략");
     return null;
@@ -25,11 +25,15 @@ async function waitForVercelDeployment(branchName, maxWait = 300000) {
   const startTime = Date.now();
   const pollInterval = 10000; // 10초
 
+  // push 시점 기록 (이전 배포와 구분하기 위해)
+  const pushTime = Date.now() - 30000; // 30초 여유
+
   console.log(`[VERCEL] ${branchName} 배포 대기 중...`);
 
   while (Date.now() - startTime < maxWait) {
     try {
-      const url = `${VERCEL_API}/v6/deployments?projectId=${CONFIG.vercel.projectId}&meta-gitBranch=${encodeURIComponent(branchName)}&limit=1&sort=created${teamParam}`;
+      // 최신 배포 목록에서 브랜치명으로 필터링 (since 파라미터로 최근 것만)
+      const url = `${VERCEL_API}/v6/deployments?projectId=${CONFIG.vercel.projectId}&limit=5&sort=created&since=${pushTime}${teamParam}`;
       const res = await fetch(url, { headers });
 
       if (!res.ok) {
@@ -38,7 +42,12 @@ async function waitForVercelDeployment(branchName, maxWait = 300000) {
       }
 
       const data = await res.json();
-      const deployment = data.deployments?.[0];
+
+      // 브랜치명이 포함된 배포 찾기 (meta.gitBranch 또는 name에서 매칭)
+      const deployment = data.deployments?.find((d) => {
+        const gitBranch = d.meta?.githubCommitRef || d.meta?.gitBranch || "";
+        return gitBranch === branchName;
+      });
 
       if (deployment) {
         const state = deployment.state || deployment.readyState;
@@ -54,6 +63,8 @@ async function waitForVercelDeployment(branchName, maxWait = 300000) {
           console.log(`[VERCEL] 배포 실패: ${state}`);
           return null;
         }
+      } else {
+        console.log("[VERCEL] 아직 배포가 생성되지 않음...");
       }
     } catch (err) {
       console.log(`[VERCEL] 폴링 에러: ${err.message}`);

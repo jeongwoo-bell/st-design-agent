@@ -7,7 +7,6 @@ const {
   truncateForSlack,
   createBranchName,
   parseClaudeOutput,
-  extractPrUrl,
   containsFigmaLink,
 } = require("./parser");
 const { waitForVercelDeployment } = require("./vercel");
@@ -154,8 +153,6 @@ async function _processRequest(message, say, threadTs) {
     threadData.hasCommit = true;
     saveThreadMap(threadBranchMap);
 
-    const prUrl = extractPrUrl(claudeOutput);
-
     // 6. Vercel 프리뷰 URL 대기
     await say({
       text: "🚀 Vercel 배포 대기 중...",
@@ -176,10 +173,6 @@ async function _processRequest(message, say, threadTs) {
       `📌 브랜치: \`${branchName}\``,
     ];
 
-    if (prUrl) {
-      resultParts.push(`🔗 PR: ${prUrl}`);
-    }
-
     if (vercelUrl) {
       resultParts.push(`🌐 프리뷰: ${vercelUrl}`);
     }
@@ -192,8 +185,8 @@ async function _processRequest(message, say, threadTs) {
       "```",
       "",
       vercelUrl
-        ? "위 프리뷰 링크에서 확인해주세요! 추가 수정이 필요하면 이 스레드에서 말씀해주세요."
-        : "추가 수정이 필요하면 이 스레드에서 말씀해주세요.",
+        ? "위 프리뷰 링크에서 확인해주세요! 추가 수정이 필요하면 이 스레드에서 말씀해주세요.\nPR 생성이 필요하면 `/pr` 이라고 입력해주세요."
+        : "추가 수정이 필요하면 이 스레드에서 말씀해주세요.\nPR 생성이 필요하면 `/pr` 이라고 입력해주세요.",
     );
 
     await say({
@@ -234,4 +227,81 @@ async function _processRequest(message, say, threadTs) {
   }
 }
 
-module.exports = { processRequest };
+async function processPrRequest(say, threadTs) {
+  const threadData = threadBranchMap.get(threadTs);
+
+  if (!threadData || !threadData.hasCommit) {
+    await say({
+      text: "⚠️ 이 스레드에서 아직 푸시된 커밋이 없어요. 먼저 수정 요청을 해주세요!",
+      thread_ts: threadTs,
+    });
+    return;
+  }
+
+  const { branchName } = threadData;
+
+  try {
+    await say({
+      text: "🔀 Draft PR 생성 중...",
+      thread_ts: threadTs,
+    });
+
+    await ensureRepo();
+    await switchToBranch(branchName);
+
+    // Claude Code로 /pr 스킬 실행
+    const { runClaudeCode } = require("./claude");
+    const prPrompt = `
+이 브랜치(${branchName})의 변경사항을 기반으로 /pr 스킬을 사용해서 Draft PR을 생성해.
+- base 브랜치: ${CONFIG.repo.branch}
+- Draft 모드로 생성
+- PR 제목과 본문은 변경사항(git diff, git log)을 분석해서 자동 생성
+- PR URL을 반드시 출력해
+
+출력 형식:
+🔗 PR: [PR URL]
+`;
+    const claudeOutput = await runClaudeCode(prPrompt, {});
+    const { extractPrUrl } = require("./parser");
+    const prUrl = extractPrUrl(claudeOutput);
+
+    // Vercel 프리뷰 URL도 함께
+    const vercelUrl = await waitForVercelDeployment(branchName);
+
+    const resultParts = ["✅ PR 생성 완료!"];
+
+    if (prUrl) {
+      resultParts.push(`🔗 PR: ${prUrl}`);
+    }
+
+    if (vercelUrl) {
+      resultParts.push(`🌐 프리뷰: ${vercelUrl}`);
+    }
+
+    if (!prUrl) {
+      resultParts.push(
+        "",
+        "📋 Claude 출력:",
+        "```",
+        truncateForSlack(claudeOutput, 1500),
+        "```",
+      );
+    }
+
+    await say({
+      text: resultParts.join("\n"),
+      thread_ts: threadTs,
+    });
+
+    await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+  } catch (error) {
+    console.error("[PR ERROR]", error);
+    await say({
+      text: `❌ PR 생성 중 에러: ${truncateForSlack(error.message, 200)}`,
+      thread_ts: threadTs,
+    });
+    await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+  }
+}
+
+module.exports = { processRequest, processPrRequest };

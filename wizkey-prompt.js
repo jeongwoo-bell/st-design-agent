@@ -3,7 +3,7 @@
 // ============================================
 
 function buildWizkeyPrompt(userRequest, context = {}) {
-  const { isFollowUp, previousChanges, isFirstCommit } = context;
+  const { isFollowUp, previousChanges } = context;
 
   let followUpContext = "";
   if (isFollowUp && previousChanges) {
@@ -18,25 +18,8 @@ ${previousChanges}
 `;
   }
 
-  const prInstruction = isFirstCommit
-    ? `
-## PR 생성 지침
-
-이번이 이 브랜치의 첫 커밋이다.
-커밋 & 푸시 성공 후, /pr 스킬을 사용해서 Draft PR을 생성해.
-- base 브랜치: develop
-- Draft 모드로 생성
-- PR 제목과 본문은 변경사항을 기반으로 자동 생성
-`
-    : `
-## PR 지침
-
-이미 PR이 존재하는 브랜치다. 커밋 & 푸시만 해. PR은 생성하지 마.
-`;
-
   return `${WIZKEY_SYSTEM}
 ${followUpContext}
-${prInstruction}
 ---
 
 ## 디자이너 요청
@@ -94,11 +77,7 @@ pnpm build
 git push origin [현재브랜치명]
 \`\`\`
 
-### 4단계: PR 생성 (첫 커밋일 때만)
-첫 커밋인 경우에만 /pr 스킬을 사용해서 Draft PR을 생성해.
-- base: develop
-- Draft 모드
-- 후속 커밋에서는 PR을 생성하지 마 (이미 있으니까)
+**PR은 생성하지 마.** PR은 디자이너가 직접 /pr 명령으로 요청할 때만 생성한다.
 
 ---
 
@@ -224,7 +203,7 @@ docs/                      # 기획 문서
 🔨 빌드: ✅ 통과
 📝 커밋: design: Section3 타이틀 텍스트 및 폰트 크기 변경
 🚀 푸시: 완료
-🔗 PR: [첫 커밋인 경우 PR URL]
+🔗 PR: (디자이너가 /pr 요청 시에만)
 \`\`\`
 
 ### 피그마 기반 구현 성공:
@@ -294,8 +273,8 @@ docs/                      # 기획 문서
 6. ✅ pnpm build로 빌드 검증 (실패 시 수정 후 재시도, 3회까지)
 7. ✅ /commit 스킬로 커밋
 8. ✅ git push
-9. ✅ 첫 커밋이면 /pr 스킬로 Draft PR 생성
-10. ✅ 정해진 형식으로 보고
+9. ✅ 정해진 형식으로 보고
+10. ❌ PR은 절대 자동 생성하지 마
 `.trim();
 
 module.exports = { buildWizkeyPrompt, WIZKEY_SYSTEM };

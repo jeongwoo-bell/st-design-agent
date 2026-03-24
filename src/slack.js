@@ -1,7 +1,7 @@
 const { App } = require("@slack/bolt");
 const { CONFIG } = require("./config");
 const { threadBranchMap } = require("./thread-map");
-const { processRequest } = require("./handler");
+const { processRequest, processPrRequest } = require("./handler");
 
 const app = new App({
   token: CONFIG.slack.botToken,
@@ -16,6 +16,14 @@ app.event("app_mention", async ({ event, say }) => {
   const message = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
   const request = message.replace(/^\/수정\s*/, "").trim();
 
+  const threadTs = event.thread_ts || event.ts;
+
+  // /pr 명령 감지
+  if (request === "/pr") {
+    await processPrRequest(say, threadTs);
+    return;
+  }
+
   if (!request) {
     await say({
       text: "수정할 내용을 알려주세요! 😊\n예: `@Design Bot Section3 타이틀 크게 해줘`",
@@ -24,7 +32,6 @@ app.event("app_mention", async ({ event, say }) => {
     return;
   }
 
-  const threadTs = event.thread_ts || event.ts;
   await processRequest(request, say, threadTs);
 });
 
@@ -35,7 +42,15 @@ app.event("message", async ({ event, say }) => {
   if (event.text && event.text.includes("<@")) return;
 
   if (event.thread_ts && threadBranchMap.has(event.thread_ts)) {
-    const request = (event.text || "").replace(/^\/수정\s*/, "").trim();
+    const text = (event.text || "").trim();
+
+    // /pr 명령 감지
+    if (text === "/pr") {
+      await processPrRequest(say, event.thread_ts);
+      return;
+    }
+
+    const request = text.replace(/^\/수정\s*/, "").trim();
     if (request) {
       await processRequest(request, say, event.thread_ts);
     }
