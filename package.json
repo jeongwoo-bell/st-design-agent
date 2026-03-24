@@ -1,0 +1,12 @@
+{
+  "name": "design-bot",
+  "version": "4.0.0",
+  "description": "SleepThera Design Bot (WIZKEY)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.1.0"
+  }
+}

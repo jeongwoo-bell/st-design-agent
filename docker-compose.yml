@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  design-bot:
+    build: .
+    container_name: design-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # 스레드-브랜치 매핑 영속화 (컨테이너 재시작해도 유지)
+      - bot-data:/tmp
+    environment:
+      - NODE_ENV=production
+      - THREAD_MAP_PATH=/tmp
+
+volumes:
+  bot-data:
