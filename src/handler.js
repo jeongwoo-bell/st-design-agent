@@ -54,7 +54,7 @@ async function _processRequest(message, say, threadTs) {
         await switchToBranch(branchName);
       } catch (err) {
         console.log(`[WARN] 기존 브랜치 전환 실패, 새로 생성: ${err.message}`);
-        branchName = createBranchName(message);
+        branchName = await createBranchName(message);
         await switchToBranch(branchName, true);
         threadBranchMap.set(threadTs, {
           branchName,
@@ -64,7 +64,7 @@ async function _processRequest(message, say, threadTs) {
         saveThreadMap(threadBranchMap);
       }
     } else {
-      branchName = createBranchName(message);
+      branchName = await createBranchName(message);
       await switchToBranch(branchName, true);
       threadBranchMap.set(threadTs, {
         branchName,
