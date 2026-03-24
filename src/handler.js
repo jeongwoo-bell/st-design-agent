@@ -10,6 +10,7 @@ const {
   extractPrUrl,
   containsFigmaLink,
 } = require("./parser");
+const { waitForVercelDeployment } = require("./vercel");
 
 async function processRequest(message, say, threadTs) {
   const queuePosition = getQueueLength();
@@ -155,7 +156,14 @@ async function _processRequest(message, say, threadTs) {
 
     const prUrl = extractPrUrl(claudeOutput);
 
-    // 6. 결과 알림
+    // 6. Vercel 프리뷰 URL 대기
+    await say({
+      text: "🚀 Vercel 배포 대기 중...",
+      thread_ts: threadTs,
+    });
+    const vercelUrl = await waitForVercelDeployment(branchName);
+
+    // 7. 결과 알림
     const commitCount = threadData.changes.length;
     const statusEmoji = isFollowUp ? "🔄" : "✅";
     const statusText = isFollowUp
@@ -172,6 +180,10 @@ async function _processRequest(message, say, threadTs) {
       resultParts.push(`🔗 PR: ${prUrl}`);
     }
 
+    if (vercelUrl) {
+      resultParts.push(`🌐 프리뷰: ${vercelUrl}`);
+    }
+
     resultParts.push(
       "",
       "📋 수정 내역:",
@@ -179,7 +191,9 @@ async function _processRequest(message, say, threadTs) {
       truncateForSlack(claudeOutput, 1500),
       "```",
       "",
-      "Vercel 프리뷰에서 확인해주세요! 추가 수정이 필요하면 이 스레드에서 말씀해주세요.",
+      vercelUrl
+        ? "위 프리뷰 링크에서 확인해주세요! 추가 수정이 필요하면 이 스레드에서 말씀해주세요."
+        : "추가 수정이 필요하면 이 스레드에서 말씀해주세요.",
     );
 
     await say({

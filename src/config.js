@@ -19,6 +19,11 @@ const CONFIG = {
   figma: {
     apiKey: process.env.FIGMA_API_KEY || null,
   },
+  vercel: {
+    token: process.env.VERCEL_TOKEN || null,
+    projectId: process.env.VERCEL_PROJECT_ID || null,
+    teamId: process.env.VERCEL_TEAM_ID || null,
+  },
   allowedChannel: process.env.ALLOWED_CHANNEL_ID || null,
   claudeTimeout: parseInt(process.env.CLAUDE_TIMEOUT) || 600000,
   slackMaxLength: 3000,

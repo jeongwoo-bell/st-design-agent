@@ -42,7 +42,7 @@ RUN chown -R botuser:botuser /app
 USER botuser
 
 # git 설정 (커밋용)
-RUN git config --global user.email "design-bot@bellthera.com" \
-    && git config --global user.name "Design Bot"
+RUN git config --global user.email "jeongwoo.lee@belltherapeutics.com" \
+    && git config --global user.name "이정우"
 
 CMD ["node", "bot.js"]
