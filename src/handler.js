@@ -1,6 +1,7 @@
 const { CONFIG } = require("./config");
+const { MESSAGES } = require("./messages");
 const { run, ensureRepo, switchToBranch } = require("./git");
-const { runClaudeCode } = require("./claude");
+const { runClaudeCode, runClaudeChat } = require("./claude");
 const { threadBranchMap, saveThreadMap } = require("./thread-map");
 const { enqueueRequest, getQueueLength } = require("./queue");
 const {
@@ -10,12 +11,59 @@ const {
   containsFigmaLink,
 } = require("./parser");
 const { waitForVercelDeployment } = require("./vercel");
+const {
+  classifyMessage,
+  generateTmi,
+  summarizeChanges,
+} = require("./classifier");
 
 async function processRequest(message, say, threadTs) {
+  // Haiku로 분류 (새 요청이든 후속이든 동일)
+  console.log("[CLASSIFIER] 메시지 분류 중...");
+  const category = await classifyMessage(message);
+  console.log(`[CLASSIFIER] 결과: ${category}`);
+
+  if (category === "chat") {
+    const chatTmi = await generateTmi();
+    const chatMsg = "💬 코드를 확인하고 답변할게요...";
+    await say({
+      text: chatTmi ? `${chatMsg}\n\n${chatTmi}` : chatMsg,
+      thread_ts: threadTs,
+    });
+    try {
+      await ensureRepo();
+      // 기존 스레드면 해당 브랜치에서 코드를 읽어야 정확한 답변 가능
+      const threadData = threadBranchMap.get(threadTs);
+      if (threadData) {
+        await switchToBranch(threadData.branchName);
+      }
+      const answer = await runClaudeChat(message);
+      await say({ text: truncateForSlack(answer, 2000), thread_ts: threadTs });
+    } catch (err) {
+      console.error("[CHAT] Claude Code 실패:", err.message);
+      await say({
+        text: "답변 생성 중 오류가 발생했어요. 다시 시도해주세요!",
+        thread_ts: threadTs,
+      });
+    } finally {
+      await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (category === "unclear") {
+    await say({
+      text: MESSAGES.UNCLEAR,
+      thread_ts: threadTs,
+    });
+    return;
+  }
+
+  // category === "code"
   const queuePosition = getQueueLength();
   if (queuePosition > 0) {
     await say({
-      text: `⏳ 앞에 ${queuePosition}개 요청이 있어요. 순서대로 처리할게요!`,
+      text: MESSAGES.QUEUE(queuePosition),
       thread_ts: threadTs,
     });
   }
@@ -31,16 +79,16 @@ async function _processRequest(message, say, threadTs) {
 
     const hasFigma = containsFigmaLink(message);
     const startMsg = hasFigma
-      ? "🎨 피그마 링크를 감지했어요! 디자인 분석 후 구현할게요..."
+      ? MESSAGES.START_FIGMA
       : isFollowUp
-        ? "🔧 같은 브랜치에서 이어서 수정할게요..."
-        : "🔧 요청을 받았어요! 브랜치 생성 중...";
+        ? MESSAGES.START_FOLLOWUP
+        : MESSAGES.START_NEW;
 
     await say({ text: startMsg, thread_ts: threadTs });
 
     if (hasFigma && !CONFIG.figma.apiKey) {
       await say({
-        text: "⚠️ 피그마 MCP가 설정되어 있지 않아요. 관리자에게 FIGMA_API_KEY 설정을 요청해주세요!\n텍스트로 수정 내용을 설명해주시면 그걸로 진행할게요.",
+        text: MESSAGES.FIGMA_NO_KEY,
         thread_ts: threadTs,
       });
     }
@@ -75,10 +123,12 @@ async function _processRequest(message, say, threadTs) {
     }
 
     // 3. Claude Code 실행
+    const tmi = await generateTmi();
+    const runningMsg = hasFigma
+      ? MESSAGES.CLAUDE_RUNNING_FIGMA
+      : MESSAGES.CLAUDE_RUNNING;
     await say({
-      text: hasFigma
-        ? "🤖 Claude Code가 피그마 디자인을 분석하고 구현 중이에요..."
-        : "🤖 Claude Code가 코드를 수정하고 있어요...\n(수정 → 빌드 검증 → 커밋 → 푸시까지 자동으로 진행돼요)",
+      text: tmi ? `${runningMsg}\n\n${tmi}` : runningMsg,
       thread_ts: threadTs,
     });
 
@@ -96,12 +146,12 @@ async function _processRequest(message, say, threadTs) {
     } catch (err) {
       if (err.message.includes("타임아웃")) {
         await say({
-          text: "⏰ 작업이 너무 오래 걸려서 중단됐어요. 요청을 더 작게 나눠서 다시 시도해주세요!",
+          text: MESSAGES.TIMEOUT,
           thread_ts: threadTs,
         });
       } else {
         await say({
-          text: `❌ Claude Code 실행 중 오류: ${truncateForSlack(err.message, 200)}`,
+          text: MESSAGES.CLAUDE_ERROR(truncateForSlack(err.message, 200)),
           thread_ts: threadTs,
         });
       }
@@ -114,7 +164,7 @@ async function _processRequest(message, say, threadTs) {
 
     if (status === "not_code") {
       await say({
-        text: "🤔 코드 수정 요청이 아닌 것 같아요. 수정할 내용을 알려주세요!\n예: `Section3 타이틀 폰트 크기 키워줘`",
+        text: MESSAGES.NOT_CODE,
         thread_ts: threadTs,
       });
       await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
@@ -123,7 +173,7 @@ async function _processRequest(message, say, threadTs) {
 
     if (status === "not_found") {
       await say({
-        text: `🔍 수정할 대상을 찾지 못했어요.\n\n${truncateForSlack(claudeOutput, 1000)}\n\n좀 더 구체적으로 알려주시면 다시 시도할게요!`,
+        text: MESSAGES.NOT_FOUND(truncateForSlack(claudeOutput, 1000)),
         thread_ts: threadTs,
       });
       await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
@@ -132,7 +182,7 @@ async function _processRequest(message, say, threadTs) {
 
     if (status === "build_failed") {
       await say({
-        text: `🔨 빌드가 실패해서 수정을 되돌렸어요.\n\n${truncateForSlack(claudeOutput, 1000)}\n\n다른 방식으로 요청해주시면 다시 시도할게요!`,
+        text: MESSAGES.BUILD_FAILED(truncateForSlack(claudeOutput, 1000)),
         thread_ts: threadTs,
       });
       await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
@@ -141,7 +191,7 @@ async function _processRequest(message, say, threadTs) {
 
     if (status === "figma_failed") {
       await say({
-        text: "🎨 피그마 디자인 데이터를 가져오지 못했어요.\n텍스트로 수정 내용을 설명해주시면 바로 반영할게요!\n예: `Section3 타이틀 32px, bold, 흰색으로 바꿔줘`",
+        text: MESSAGES.FIGMA_FAILED,
         thread_ts: threadTs,
       });
       await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
@@ -155,38 +205,28 @@ async function _processRequest(message, say, threadTs) {
 
     // 6. Vercel 프리뷰 URL 대기
     await say({
-      text: "🚀 Vercel 배포 대기 중...",
+      text: MESSAGES.VERCEL_WAITING,
       thread_ts: threadTs,
     });
     const vercelUrl = await waitForVercelDeployment(branchName);
 
     // 7. 결과 알림
-    const commitCount = threadData.changes.length;
     const statusEmoji = isFollowUp ? "🔄" : "✅";
-    const statusText = isFollowUp
-      ? `추가 수정 완료! (이 스레드 ${commitCount}번째 수정)`
-      : "코드 수정 완료!";
+    const statusText = isFollowUp ? "추가 수정 완료!" : "수정 완료!";
 
-    const resultParts = [
-      `${statusEmoji} ${statusText}`,
-      "",
-      `📌 브랜치: \`${branchName}\``,
-    ];
+    const summary =
+      (await summarizeChanges(claudeOutput)) ||
+      truncateForSlack(claudeOutput, 500);
+
+    const resultParts = [`${statusEmoji} ${statusText}`, "", summary];
 
     if (vercelUrl) {
-      resultParts.push(`🌐 프리뷰: ${vercelUrl}`);
+      resultParts.push("", `🌐 프리뷰: ${vercelUrl}`);
     }
 
     resultParts.push(
       "",
-      "📋 수정 내역:",
-      "```",
-      truncateForSlack(claudeOutput, 1500),
-      "```",
-      "",
-      vercelUrl
-        ? "위 프리뷰 링크에서 확인해주세요! 추가 수정이 필요하면 이 스레드에서 말씀해주세요.\nPR 생성이 필요하면 `/pr` 이라고 입력해주세요."
-        : "추가 수정이 필요하면 이 스레드에서 말씀해주세요.\nPR 생성이 필요하면 `/pr` 이라고 입력해주세요.",
+      vercelUrl ? MESSAGES.RESULT_FOOTER_WITH_PREVIEW : MESSAGES.RESULT_FOOTER,
     );
 
     await say({
@@ -199,23 +239,23 @@ async function _processRequest(message, say, threadTs) {
   } catch (error) {
     console.error("[ERROR]", error);
 
-    let errorMsg = `❌ 에러가 발생했어요: ${truncateForSlack(error.message, 200)}`;
+    let errorMsg = MESSAGES.GENERIC_ERROR(truncateForSlack(error.message, 200));
 
     if (
       error.message.includes("Authentication") ||
       error.message.includes("403")
     ) {
-      errorMsg = "🔑 GitHub 인증에 문제가 있어요. 관리자에게 알려주세요!";
+      errorMsg = MESSAGES.AUTH_ERROR;
     } else if (
       error.message.includes("CONFLICT") ||
       error.message.includes("merge")
     ) {
-      errorMsg = "⚠️ Git 충돌이 발생했어요. 개발팀에 알려주세요!";
+      errorMsg = MESSAGES.CONFLICT_ERROR;
     } else if (
       error.message.includes("disk") ||
       error.message.includes("No space")
     ) {
-      errorMsg = "💾 서버 디스크 용량이 부족해요. 관리자에게 알려주세요!";
+      errorMsg = MESSAGES.DISK_ERROR;
     }
 
     await say({ text: errorMsg, thread_ts: threadTs });
@@ -232,7 +272,7 @@ async function processPrRequest(say, threadTs) {
 
   if (!threadData || !threadData.hasCommit) {
     await say({
-      text: "⚠️ 이 스레드에서 아직 푸시된 커밋이 없어요. 먼저 수정 요청을 해주세요!",
+      text: MESSAGES.NO_COMMIT,
       thread_ts: threadTs,
     });
     return;
@@ -242,7 +282,7 @@ async function processPrRequest(say, threadTs) {
 
   try {
     await say({
-      text: "🔀 Draft PR 생성 중...",
+      text: MESSAGES.PR_CREATING,
       thread_ts: threadTs,
     });
 
@@ -297,7 +337,7 @@ async function processPrRequest(say, threadTs) {
   } catch (error) {
     console.error("[PR ERROR]", error);
     await say({
-      text: `❌ PR 생성 중 에러: ${truncateForSlack(error.message, 200)}`,
+      text: MESSAGES.PR_ERROR(truncateForSlack(error.message, 200)),
       thread_ts: threadTs,
     });
     await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});

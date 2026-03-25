@@ -1,5 +1,6 @@
 const { App } = require("@slack/bolt");
 const { CONFIG } = require("./config");
+const { MESSAGES } = require("./messages");
 const { threadBranchMap } = require("./thread-map");
 const { processRequest, processPrRequest } = require("./handler");
 
@@ -26,7 +27,7 @@ app.event("app_mention", async ({ event, say }) => {
 
   if (!request) {
     await say({
-      text: "수정할 내용을 알려주세요! 😊\n예: `@Design Bot Section3 타이틀 크게 해줘`",
+      text: `${MESSAGES.GUIDE} 😊`,
       thread_ts: event.ts,
     });
     return;

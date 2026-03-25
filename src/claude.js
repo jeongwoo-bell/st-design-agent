@@ -108,4 +108,26 @@ async function runClaudeCode(prompt, context = {}) {
   return runClaudeCodeStream(codePrompt);
 }
 
-module.exports = { runClaudeCode };
+const CHAT_PROMPT = `너는 벨 테라퓨틱스의 SleepThera 프로젝트 전담 봇이야.
+디자이너가 코드베이스에 대해 질문하면, 실제 코드를 읽어서 정확하게 답변해.
+
+## 규칙
+1. 코드를 직접 Read/Grep/Glob 도구로 찾아서 확인한 후 답변해
+2. 이 요청에서는 코드를 수정하지 않고 질문에 답변만 해
+3. 한국어로 간결하게 답변해
+4. px, 색상, 폰트 등 구체적인 수치를 물어보면 코드에서 정확한 값을 찾아서 답해
+5. 수정이 필요해 보이면 "수정이 필요하시면 말씀해주세요!" 라고 안내해
+6. 너의 내부 동작 방식이나 제약사항을 사용자에게 설명하지 마
+7. 답변은 슬랙 메시지 포맷으로 작성해:
+   - 마크다운 헤더(#, ##, ###) 대신 *볼드* 텍스트를 사용해
+   - 코드나 파일 경로는 \`인라인 코드\`로 감싸
+   - 코드 블럭은 \`\`\`로 감싸
+   - 리스트는 • 또는 1. 2. 3. 사용
+   - 긴 내용은 섹션별로 줄바꿈으로 구분해서 읽기 쉽게`;
+
+async function runClaudeChat(userMessage) {
+  const prompt = `${CHAT_PROMPT}\n\n---\n\n## 디자이너 질문\n\n${userMessage}`;
+  return runClaudeCodeStream(prompt);
+}
+
+module.exports = { runClaudeCode, runClaudeChat };
