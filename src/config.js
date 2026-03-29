@@ -1,5 +1,3 @@
-const path = require("path");
-
 const CONFIG = {
   slack: {
     botToken: process.env.SLACK_BOT_TOKEN,
@@ -25,7 +23,6 @@ const CONFIG = {
     teamId: process.env.VERCEL_TEAM_ID || null,
   },
   allowedChannel: process.env.ALLOWED_CHANNEL_ID || null,
-  claudeTimeout: parseInt(process.env.CLAUDE_TIMEOUT) || 600000,
   slackMaxLength: 3000,
 };
 

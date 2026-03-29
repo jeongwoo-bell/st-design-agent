@@ -19,9 +19,6 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # pnpm 설치
 RUN npm install -g pnpm
 
-# Claude Code CLI 설치
-RUN npm install -g @anthropic-ai/claude-code
-
 # 봇 유저 생성 (root로 실행하지 않기 위해)
 RUN useradd -m -s /bin/bash botuser \
     && mkdir -p /home/botuser/.claude \

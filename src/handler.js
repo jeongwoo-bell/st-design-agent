@@ -1,13 +1,16 @@
+// ============================================
+// v5 오케스트레이터 — 봇이 전체 흐름을 직접 제어
+// ============================================
+const path = require("path");
 const { CONFIG } = require("./config");
 const { MESSAGES } = require("./messages");
 const { run, ensureRepo, switchToBranch } = require("./git");
-const { runClaudeCode, runClaudeChat } = require("./claude");
+const { CHAT_SYSTEM_PROMPT } = require("../wizkey-prompt");
 const { threadBranchMap, saveThreadMap } = require("./thread-map");
 const { enqueueRequest, getQueueLength } = require("./queue");
 const {
   truncateForSlack,
   createBranchName,
-  parseClaudeOutput,
   containsFigmaLink,
 } = require("./parser");
 const { waitForVercelDeployment } = require("./vercel");
@@ -16,31 +19,73 @@ const {
   generateTmi,
   summarizeChanges,
 } = require("./classifier");
+const { collectFileTree, identifyRelevantFiles, readFiles } = require("./file-analyzer");
+const { fetchFigmaData } = require("./figma");
+const { generateCodeChanges, fixBuildError } = require("./code-generator");
+const { applyChanges, runBuild, revertChanges } = require("./builder");
+const { WebClient } = require("@slack/web-api");
+const slackClient = new WebClient(CONFIG.slack.botToken);
 
-async function processRequest(message, say, threadTs) {
-  // Haiku로 분류 (새 요청이든 후속이든 동일)
+async function addReaction(channel, timestamp, name) {
+  try {
+    await slackClient.reactions.add({ channel, timestamp, name });
+  } catch (err) {
+    console.warn(`[REACTION] ${name} 추가 실패:`, err.message);
+  }
+}
+
+async function getUserName(userId) {
+  try {
+    const result = await slackClient.users.info({ user: userId });
+    return result.user.profile.display_name || result.user.real_name || null;
+  } catch (err) {
+    console.warn("[USER] 이름 가져오기 실패:", err.message);
+    return null;
+  }
+}
+
+async function processRequest(message, say, threadTs, channel, messageTs, userId) {
+  // 👀 리액션으로 확인 표시 + 유저 이름 가져오기 (병렬)
+  const [, userName] = await Promise.all([
+    channel && messageTs ? addReaction(channel, messageTs, "eyes") : Promise.resolve(),
+    userId ? getUserName(userId) : Promise.resolve(null),
+  ]);
+
+  // Haiku로 분류
   console.log("[CLASSIFIER] 메시지 분류 중...");
   const category = await classifyMessage(message);
   console.log(`[CLASSIFIER] 결과: ${category}`);
 
   if (category === "chat") {
-    const chatTmi = await generateTmi();
-    const chatMsg = "💬 코드를 확인하고 답변할게요...";
-    await say({
-      text: chatTmi ? `${chatMsg}\n\n${chatTmi}` : chatMsg,
-      thread_ts: threadTs,
-    });
     try {
       await ensureRepo();
-      // 기존 스레드면 해당 브랜치에서 코드를 읽어야 정확한 답변 가능
       const threadData = threadBranchMap.get(threadTs);
       if (threadData) {
         await switchToBranch(threadData.branchName);
       }
-      const answer = await runClaudeChat(message);
+
+      // 파일 트리 수집 → 관련 파일 특정 → 읽기
+      const repoPath = CONFIG.repo.path;
+      const fileTree = collectFileTree(repoPath);
+      const relevantPaths = await identifyRelevantFiles(message, fileTree, null);
+      const fileContents = readFiles(relevantPaths, repoPath);
+
+      // Haiku에게 파일 내용 + 질문 전달
+      const { callHaiku } = require("./claude");
+      let prompt = message;
+      if (fileContents.length > 0) {
+        const filesContext = fileContents
+          .map((f) => `### ${f.path}\n\`\`\`\n${f.content}\n\`\`\``)
+          .join("\n\n");
+        prompt = `## 질문\n${message}\n\n## 참고 파일\n${filesContext}`;
+      }
+      if (userName) {
+        prompt = `사용자 이름: ${userName}\n\n${prompt}`;
+      }
+      const answer = await callHaiku(CHAT_SYSTEM_PROMPT, prompt);
       await say({ text: truncateForSlack(answer, 2000), thread_ts: threadTs });
     } catch (err) {
-      console.error("[CHAT] Claude Code 실패:", err.message);
+      console.error("[CHAT] 답변 생성 실패:", err.message);
       await say({
         text: "답변 생성 중 오류가 발생했어요. 다시 시도해주세요!",
         thread_ts: threadTs,
@@ -52,25 +97,19 @@ async function processRequest(message, say, threadTs) {
   }
 
   if (category === "unclear") {
-    await say({
-      text: MESSAGES.UNCLEAR,
-      thread_ts: threadTs,
-    });
+    await say({ text: MESSAGES.UNCLEAR, thread_ts: threadTs });
     return;
   }
 
   // category === "code"
   const queuePosition = getQueueLength();
   if (queuePosition > 0) {
-    await say({
-      text: MESSAGES.QUEUE(queuePosition),
-      thread_ts: threadTs,
-    });
+    await say({ text: MESSAGES.QUEUE(queuePosition), thread_ts: threadTs });
   }
-  return enqueueRequest(() => _processRequest(message, say, threadTs));
+  return enqueueRequest(() => _processCodeRequest(message, say, threadTs, userName));
 }
 
-async function _processRequest(message, say, threadTs) {
+async function _processCodeRequest(message, say, threadTs, userName) {
   try {
     // 1. 스레드 → 브랜치 매핑
     const existing = threadBranchMap.get(threadTs);
@@ -85,13 +124,6 @@ async function _processRequest(message, say, threadTs) {
         : MESSAGES.START_NEW;
 
     await say({ text: startMsg, thread_ts: threadTs });
-
-    if (hasFigma && !CONFIG.figma.apiKey) {
-      await say({
-        text: MESSAGES.FIGMA_NO_KEY,
-        thread_ts: threadTs,
-      });
-    }
 
     // 2. 레포 준비 & 브랜치 전환
     await ensureRepo();
@@ -122,7 +154,25 @@ async function _processRequest(message, say, threadTs) {
       saveThreadMap(threadBranchMap);
     }
 
-    // 3. Claude Code 실행
+    // 3. 피그마 데이터 가져오기 (있으면)
+    let figmaData = null;
+    if (hasFigma) {
+      if (!CONFIG.figma.apiKey) {
+        await say({ text: MESSAGES.FIGMA_NO_KEY, thread_ts: threadTs });
+      } else {
+        try {
+          figmaData = await fetchFigmaData(message);
+          if (figmaData) {
+            console.log(`[FIGMA] 디자인 스펙 ${figmaData.specs.length}건 추출`);
+          }
+        } catch (err) {
+          console.error("[FIGMA] 데이터 가져오기 실패:", err.message);
+          await say({ text: MESSAGES.FIGMA_FAILED, thread_ts: threadTs });
+        }
+      }
+    }
+
+    // 4. 파일 트리 수집 (fs, 즉시)
     const tmi = await generateTmi();
     const runningMsg = hasFigma
       ? MESSAGES.CLAUDE_RUNNING_FIGMA
@@ -132,92 +182,172 @@ async function _processRequest(message, say, threadTs) {
       thread_ts: threadTs,
     });
 
+    const repoPath = CONFIG.repo.path;
+    console.log("[FILE-ANALYZER] 파일 트리 수집 중...");
+    const fileTree = collectFileTree(repoPath);
+    console.log(`[FILE-ANALYZER] 파일 ${fileTree.length}개 발견`);
+
+    // 5. Haiku로 관련 파일 특정
+    console.log("[FILE-ANALYZER] 관련 파일 특정 중...");
+    const relevantPaths = await identifyRelevantFiles(
+      message,
+      fileTree,
+      figmaData,
+    );
+    console.log(`[FILE-ANALYZER] 관련 파일 ${relevantPaths.length}개 특정`);
+
+    // 6. 관련 파일 내용 읽기 (fs, 즉시)
+    const fileContents = readFiles(relevantPaths, repoPath);
+    console.log(`[FILE-ANALYZER] 파일 ${fileContents.length}개 읽기 완료`);
+
+    // 7. 컨텍스트 구성
     const threadData = threadBranchMap.get(threadTs);
-    const isFirstCommit = !threadData.hasCommit;
     const context = {
       isFollowUp,
-      isFirstCommit,
+      isFirstCommit: !threadData.hasCommit,
       previousChanges: isFollowUp ? threadData.changes.join("\n---\n") : null,
     };
 
-    let claudeOutput;
+    // 8. Sonnet으로 수정안 생성 (핵심)
+    console.log("[CODE-GEN] 수정안 생성 중...");
+    let changes;
     try {
-      claudeOutput = await runClaudeCode(message, context);
+      changes = await generateCodeChanges(
+        message,
+        fileContents,
+        figmaData,
+        context,
+        repoPath,
+      );
     } catch (err) {
-      if (err.message.includes("타임아웃")) {
-        await say({
-          text: MESSAGES.TIMEOUT,
-          thread_ts: threadTs,
-        });
-      } else {
-        await say({
-          text: MESSAGES.CLAUDE_ERROR(truncateForSlack(err.message, 200)),
-          thread_ts: threadTs,
-        });
+      console.error("[CODE-GEN] 수정안 생성 실패:", err.message);
+      await say({
+        text: MESSAGES.CLAUDE_ERROR(truncateForSlack(err.message, 200)),
+        thread_ts: threadTs,
+      });
+      await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+      return;
+    }
+
+    if (changes.length === 0) {
+      await say({
+        text: "수정할 내용을 찾지 못했어요. 좀 더 구체적으로 요청해주세요!",
+        thread_ts: threadTs,
+      });
+      await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+      return;
+    }
+
+    // 9. 수정안 적용
+    console.log(`[BUILDER] 수정안 ${changes.length}건 적용 중...`);
+    const applyResult = await applyChanges(changes, repoPath);
+    console.log(
+      `[BUILDER] 적용 ${applyResult.applied}건, 에러 ${applyResult.errors.length}건`,
+    );
+
+    if (applyResult.errors.length > 0) {
+      for (const err of applyResult.errors) {
+        console.warn(`[BUILDER] ${err}`);
       }
+    }
+
+    if (applyResult.applied === 0) {
+      await say({
+        text: "수정사항을 적용하지 못했어요. 다시 시도해주세요.",
+        thread_ts: threadTs,
+      });
+      await revertChanges(repoPath);
       await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
       return;
     }
 
-    // 4. Claude 출력 분석
-    const { status } = parseClaudeOutput(claudeOutput);
+    // 10. 빌드 검증 + 재시도 루프 (최대 3회)
+    let buildResult;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      console.log(`[BUILDER] 빌드 시도 ${attempt}/3...`);
+      buildResult = await runBuild(repoPath);
+      if (buildResult.success) break;
 
-    if (status === "not_code") {
+      if (attempt < 3) {
+        console.log("[CODE-GEN] 빌드 에러 수정 요청 중...");
+        // 현재 파일 상태를 다시 읽어서 전달
+        const currentFiles = readFiles(relevantPaths, repoPath);
+        try {
+          const fixes = await fixBuildError(
+            buildResult.stderr,
+            currentFiles,
+            repoPath,
+          );
+          if (fixes.length > 0) {
+            await applyChanges(fixes, repoPath);
+          }
+        } catch (err) {
+          console.error("[CODE-GEN] 빌드 에러 수정 실패:", err.message);
+        }
+      }
+    }
+
+    if (!buildResult.success) {
+      await revertChanges(repoPath);
       await say({
-        text: MESSAGES.NOT_CODE,
+        text: MESSAGES.BUILD_FAILED(truncateForSlack(buildResult.stderr, 500)),
         thread_ts: threadTs,
       });
       await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
       return;
     }
 
-    if (status === "not_found") {
-      await say({
-        text: MESSAGES.NOT_FOUND(truncateForSlack(claudeOutput, 1000)),
-        thread_ts: threadTs,
-      });
-      await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-      return;
+    // 11. git commit + push
+    console.log("[GIT] 커밋 & 푸시 중...");
+    const changedFiles = changes.map((c) => c.filePath);
+    try {
+      await run(`git add ${changedFiles.map((f) => `"${f}"`).join(" ")}`, repoPath);
+    } catch {
+      await run("git add -A", repoPath);
     }
 
-    if (status === "build_failed") {
-      await say({
-        text: MESSAGES.BUILD_FAILED(truncateForSlack(claudeOutput, 1000)),
-        thread_ts: threadTs,
-      });
-      await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-      return;
+    // Haiku로 커밋 메시지 생성
+    const { callHaiku } = require("./claude");
+    let commitMsg;
+    try {
+      const changeSummaryForCommit = changedFiles.join(", ");
+      commitMsg = await callHaiku(
+        `너는 git 커밋 메시지 생성기야. design: 접두사로 시작하는 한국어 커밋 메시지를 한 줄로 작성해. 50자 이내. 커밋 메시지만 출력해.`,
+        `요청: ${message}\n수정된 파일: ${changeSummaryForCommit}`,
+      );
+      commitMsg = commitMsg.trim().replace(/"/g, '\\"');
+    } catch {
+      commitMsg = `design: ${message.slice(0, 50).replace(/"/g, '\\"')}`;
     }
+    await run(`git commit -m "${commitMsg}"`, repoPath);
+    await run(`git push origin ${branchName}`, repoPath);
+    const pushTimestamp = Date.now();
 
-    if (status === "figma_failed") {
-      await say({
-        text: MESSAGES.FIGMA_FAILED,
-        thread_ts: threadTs,
-      });
-      await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-      return;
-    }
-
-    // 5. 성공 - 변경 이력 업데이트
-    threadData.changes.push(claudeOutput.slice(0, 500));
+    // 12. 스레드 데이터 업데이트
     threadData.hasCommit = true;
+    threadData.changes.push(
+      changes
+        .map((c) => `${c.type}: ${c.filePath}`)
+        .join("\n")
+        .slice(0, 500),
+    );
     saveThreadMap(threadBranchMap);
 
-    // 6. Vercel 프리뷰 URL 대기
-    await say({
-      text: MESSAGES.VERCEL_WAITING,
-      thread_ts: threadTs,
-    });
-    const vercelUrl = await waitForVercelDeployment(branchName);
+    // 13. Vercel 프리뷰 URL 대기
+    await say({ text: MESSAGES.VERCEL_WAITING, thread_ts: threadTs });
+    const vercelUrl = await waitForVercelDeployment(branchName, pushTimestamp);
 
-    // 7. 결과 알림
-    const statusEmoji = isFollowUp ? "🔄" : "✅";
-    const statusText = isFollowUp ? "추가 수정 완료!" : "수정 완료!";
-
+    // 14. 결과 요약 생성
+    const changeSummary = changes
+      .map((c) => `${c.type === "create" ? "생성" : "수정"}: ${c.filePath}`)
+      .join("\n");
     const summary =
-      (await summarizeChanges(claudeOutput)) ||
-      truncateForSlack(claudeOutput, 500);
+      (await summarizeChanges(changeSummary)) || changeSummary;
 
+    // 15. 슬랙 응답
+    const statusEmoji = isFollowUp ? "🔄" : "✅";
+    const namePrefix = userName ? `${userName}님, ` : "";
+    const statusText = isFollowUp ? `${namePrefix}추가 수정 완료!` : `${namePrefix}수정 완료!`;
     const resultParts = [`${statusEmoji} ${statusText}`, "", summary];
 
     if (vercelUrl) {
@@ -226,7 +356,9 @@ async function _processRequest(message, say, threadTs) {
 
     resultParts.push(
       "",
-      vercelUrl ? MESSAGES.RESULT_FOOTER_WITH_PREVIEW : MESSAGES.RESULT_FOOTER,
+      vercelUrl
+        ? MESSAGES.RESULT_FOOTER_WITH_PREVIEW
+        : MESSAGES.RESULT_FOOTER,
     );
 
     await say({
@@ -234,12 +366,13 @@ async function _processRequest(message, say, threadTs) {
       thread_ts: threadTs,
     });
 
-    // develop으로 복귀
     await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
   } catch (error) {
     console.error("[ERROR]", error);
 
-    let errorMsg = MESSAGES.GENERIC_ERROR(truncateForSlack(error.message, 200));
+    let errorMsg = MESSAGES.GENERIC_ERROR(
+      truncateForSlack(error.message, 200),
+    );
 
     if (
       error.message.includes("Authentication") ||
@@ -271,68 +404,89 @@ async function processPrRequest(say, threadTs) {
   const threadData = threadBranchMap.get(threadTs);
 
   if (!threadData || !threadData.hasCommit) {
-    await say({
-      text: MESSAGES.NO_COMMIT,
-      thread_ts: threadTs,
-    });
+    await say({ text: MESSAGES.NO_COMMIT, thread_ts: threadTs });
     return;
   }
 
   const { branchName } = threadData;
 
   try {
-    await say({
-      text: MESSAGES.PR_CREATING,
-      thread_ts: threadTs,
-    });
-
+    await say({ text: MESSAGES.PR_CREATING, thread_ts: threadTs });
     await ensureRepo();
     await switchToBranch(branchName);
 
-    // Claude Code로 /pr 스킬 실행
-    const { runClaudeCode } = require("./claude");
-    const prPrompt = `
-이 브랜치(${branchName})의 변경사항을 기반으로 /pr 스킬을 사용해서 Draft PR을 생성해.
-- base 브랜치: ${CONFIG.repo.branch}
-- Draft 모드로 생성
-- PR 제목과 본문은 변경사항(git diff, git log)을 분석해서 자동 생성
-- PR URL을 반드시 출력해
+    // git log로 커밋 이력 가져오기
+    const gitLog = await run(
+      `git log ${CONFIG.repo.branch}..HEAD --pretty=format:"%s"`,
+      CONFIG.repo.path,
+    );
 
-출력 형식:
-🔗 PR: [PR URL]
-`;
-    const claudeOutput = await runClaudeCode(prPrompt, {});
-    const { extractPrUrl } = require("./parser");
-    const prUrl = extractPrUrl(claudeOutput);
+    // Haiku로 PR 제목 + 본문 생성
+    const { callHaiku } = require("./claude");
+    let prTitle, prBody;
+    try {
+      const prContent = await callHaiku(
+        `너는 GitHub PR 작성기야. 디자인 수정 PR을 작성해.
 
-    // Vercel 프리뷰 URL도 함께
-    const vercelUrl = await waitForVercelDeployment(branchName);
+출력 형식 (정확히 따라):
+TITLE: design: [한국어 제목 50자 이내]
+BODY:
+## Summary
+- [변경사항 1]
+- [변경사항 2]
 
-    const resultParts = ["✅ PR 생성 완료!"];
+## Changed Files
+- [파일 목록]
 
-    if (prUrl) {
-      resultParts.push(`🔗 PR: ${prUrl}`);
+다른 텍스트 없이 위 형식만 출력해.`,
+        `브랜치: ${branchName}\n커밋 이력:\n${gitLog}\n\n변경 파일:\n${threadData.changes.join("\n")}`,
+      );
+      const titleMatch = prContent.match(/TITLE:\s*(.+)/);
+      const bodyMatch = prContent.match(/BODY:\s*([\s\S]+)/);
+      prTitle = titleMatch ? titleMatch[1].trim() : `design: ${branchName.replace("design/", "")}`;
+      prBody = bodyMatch ? bodyMatch[1].trim() : threadData.changes.join("\n");
+    } catch {
+      prTitle = `design: ${branchName.replace("design/", "")}`;
+      prBody = threadData.changes.join("\n");
     }
 
-    if (vercelUrl) {
-      resultParts.push(`🌐 프리뷰: ${vercelUrl}`);
+    // PR body를 레포 밖 임시 파일로 저장 (git에 안 잡히게)
+    const fs = require("fs");
+    const prBodyPath = path.join("/tmp", "design-bot-pr-body.tmp");
+    fs.writeFileSync(prBodyPath, prBody, "utf-8");
+    const safeTitle = prTitle.replace(/"/g, '\\"').replace(/`/g, "\\`");
+
+    let prUrl;
+    try {
+      // 이미 PR이 있는지 확인
+      const existingPr = await run(
+        `gh pr view ${branchName} --json url --jq .url`,
+        CONFIG.repo.path,
+      );
+      if (existingPr && existingPr.includes("github.com")) {
+        prUrl = existingPr.trim();
+        console.log(`[PR] 기존 PR 발견: ${prUrl}`);
+      }
+    } catch {
+      // PR 없음 → 새로 생성
     }
 
     if (!prUrl) {
-      resultParts.push(
-        "",
-        "📋 Claude 출력:",
-        "```",
-        truncateForSlack(claudeOutput, 1500),
-        "```",
+      const prOutput = await run(
+        `gh pr create --title "${safeTitle}" --body-file ${prBodyPath} --base ${CONFIG.repo.branch} --draft`,
+        CONFIG.repo.path,
       );
+      const prUrlMatch = prOutput.match(
+        /https:\/\/github\.com\/[^\s)]+\/pull\/\d+/,
+      );
+      prUrl = prUrlMatch ? prUrlMatch[0] : null;
     }
+    fs.unlinkSync(prBodyPath);
 
-    await say({
-      text: resultParts.join("\n"),
-      thread_ts: threadTs,
-    });
+    const resultParts = ["✅ PR 생성 완료!"];
+    if (prUrl) resultParts.push(`🔗 PR: ${prUrl}`);
 
+    await say({ text: resultParts.join("\n"), thread_ts: threadTs });
     await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
   } catch (error) {
     console.error("[PR ERROR]", error);

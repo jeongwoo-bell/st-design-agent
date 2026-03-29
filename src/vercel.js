@@ -8,7 +8,7 @@ const VERCEL_API = "https://api.vercel.com";
  * @param {number} maxWait - 최대 대기 시간(ms), 기본 3분
  * @returns {Promise<string|null>} 프리뷰 URL 또는 null
  */
-async function waitForVercelDeployment(branchName, maxWait = 180000) {
+async function waitForVercelDeployment(branchName, pushTimestamp, maxWait = 180000) {
   if (!CONFIG.vercel.token || !CONFIG.vercel.projectId) {
     console.log("[VERCEL] 토큰 또는 프로젝트 ID 미설정 — 프리뷰 URL 생략");
     return null;
@@ -25,8 +25,8 @@ async function waitForVercelDeployment(branchName, maxWait = 180000) {
   const startTime = Date.now();
   const pollInterval = 10000; // 10초
 
-  // push 시점 기록 (이전 배포와 구분하기 위해)
-  const pushTime = Date.now() - 30000; // 30초 여유
+  // push 시점 기준 30초 여유 (외부에서 주입)
+  const pushTime = (pushTimestamp || Date.now()) - 30000;
 
   console.log(`[VERCEL] ${branchName} 배포 대기 중...`);
 

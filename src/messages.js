@@ -17,9 +17,9 @@ const MESSAGES = {
   FIGMA_NO_KEY:
     "⚠️ 피그마 MCP가 설정되어 있지 않아요. 관리자에게 FIGMA_API_KEY 설정을 요청해주세요!\n텍스트로 수정 내용을 설명해주시면 그걸로 진행할게요.",
   CLAUDE_RUNNING_FIGMA:
-    "🤖 Claude Code가 피그마 디자인을 분석하고 구현 중이에요...",
+    "🤖 피그마 디자인을 분석하고 구현 중이에요...",
   CLAUDE_RUNNING:
-    "🤖 Claude Code가 코드를 수정하고 있어요...\n(수정 → 빌드 검증 → 커밋 → 푸시까지 자동으로 진행돼요)",
+    "🤖 코드를 수정하고 있어요...\n(수정 → 빌드 검증 → 커밋 → 푸시까지 자동으로 진행돼요)",
   VERCEL_WAITING: "🚀 Vercel 배포 대기 중...",
   PR_CREATING: "🔀 Draft PR 생성 중...",
 
@@ -32,7 +32,7 @@ const MESSAGES = {
     `🔨 빌드가 실패해서 수정을 되돌렸어요.\n\n${detail}\n\n다른 방식으로 요청해주시면 다시 시도할게요!`,
   FIGMA_FAILED:
     "🎨 피그마 디자인 데이터를 가져오지 못했어요.\n텍스트로 수정 내용을 설명해주시면 바로 반영할게요!",
-  CLAUDE_ERROR: (detail) => `❌ Claude Code 실행 중 오류: ${detail}`,
+  CLAUDE_ERROR: (detail) => `❌ AI 실행 중 오류: ${detail}`,
   AUTH_ERROR: "🔑 GitHub 인증에 문제가 있어요. 관리자에게 알려주세요!",
   CONFLICT_ERROR: "⚠️ Git 충돌이 발생했어요. 개발팀에 알려주세요!",
   DISK_ERROR: "💾 서버 디스크 용량이 부족해요. 관리자에게 알려주세요!",
