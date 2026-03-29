@@ -50,37 +50,13 @@ async function ensureRepo() {
   await run(`git checkout ${CONFIG.repo.branch}`);
   await run(`git pull origin ${CONFIG.repo.branch}`);
 
-  await ensureMcpConfig();
+  // node_modules 없으면 설치
+  if (!fs.existsSync(path.join(CONFIG.repo.path, "node_modules"))) {
+    console.log("[REPO] 의존성 설치 중...");
+    await run("pnpm install");
+  }
+
   console.log("[REPO] 레포 준비 완료");
-}
-
-async function ensureMcpConfig() {
-  const mcpPath = path.join(CONFIG.repo.path, ".mcp.json");
-
-  if (!CONFIG.figma.apiKey) {
-    console.log("[MCP] FIGMA_API_KEY 미설정 - 피그마 MCP 비활성화");
-    return;
-  }
-
-  if (fs.existsSync(mcpPath)) {
-    console.log("[MCP] .mcp.json 이미 존재");
-    return;
-  }
-
-  const mcpConfig = {
-    mcpServers: {
-      "figma-developer-mcp": {
-        command: "npx",
-        args: ["-y", "figma-developer-mcp", "--stdio"],
-        env: {
-          FIGMA_API_KEY: CONFIG.figma.apiKey,
-        },
-      },
-    },
-  };
-
-  fs.writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2));
-  console.log("[MCP] .mcp.json 생성 완료");
 }
 
 async function switchToBranch(branchName, createNew = false) {

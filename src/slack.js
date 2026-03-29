@@ -33,7 +33,7 @@ app.event("app_mention", async ({ event, say }) => {
     return;
   }
 
-  await processRequest(request, say, threadTs);
+  await processRequest(request, say, threadTs, event.channel, event.ts, event.user);
 });
 
 // 스레드 답글 (멘션 없이) - 봇이 관리하는 스레드에서 자연어로 후속 요청
@@ -53,7 +53,7 @@ app.event("message", async ({ event, say }) => {
 
     const request = text.replace(/^\/수정\s*/, "").trim();
     if (request) {
-      await processRequest(request, say, event.thread_ts);
+      await processRequest(request, say, event.thread_ts, event.channel, event.ts, event.user);
     }
   }
 });

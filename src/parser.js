@@ -44,22 +44,6 @@ async function createBranchName(message) {
   return `design/request-${timestamp}-${slug}`;
 }
 
-function parseClaudeOutput(output) {
-  if (output.includes("NOT_FOUND")) return { status: "not_found", output };
-  if (output.includes("NOT_CODE_REQUEST"))
-    return { status: "not_code", output };
-  if (output.includes("BUILD_FAILED"))
-    return { status: "build_failed", output };
-  if (output.includes("FIGMA_MCP_FAILED"))
-    return { status: "figma_failed", output };
-  return { status: "ok", output };
-}
-
-function extractPrUrl(output) {
-  const match = output.match(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/);
-  return match ? match[0] : null;
-}
-
 function containsFigmaLink(text) {
   return /figma\.com\/(design|file)\//.test(text);
 }
@@ -67,7 +51,5 @@ function containsFigmaLink(text) {
 module.exports = {
   truncateForSlack,
   createBranchName,
-  parseClaudeOutput,
-  extractPrUrl,
   containsFigmaLink,
 };
