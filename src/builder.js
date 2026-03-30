@@ -12,11 +12,13 @@ const execAsync = promisify(exec);
  * 수정안을 실제 파일에 적용
  * @param {Array} changes - [{ type: "edit"|"create", filePath, ... }]
  * @param {string} repoPath - 레포 루트 경로
- * @returns {{ applied: number, errors: string[] }}
+ * @returns {{ applied: Array, failed: Array }}
+ *   applied: 성공한 change 객체 배열
+ *   failed: { change, reason } 배열
  */
 async function applyChanges(changes, repoPath) {
-  let applied = 0;
-  const errors = [];
+  const applied = [];
+  const failed = [];
 
   for (const change of changes) {
     const absPath = path.join(repoPath, change.filePath);
@@ -26,37 +28,37 @@ async function applyChanges(changes, repoPath) {
         await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
         await fs.promises.writeFile(absPath, change.content, "utf-8");
         console.log(`[BUILDER] 생성: ${change.filePath}`);
-        applied++;
+        applied.push(change);
       } else if (change.type === "edit") {
         const current = await fs.promises.readFile(absPath, "utf-8");
 
         if (!current.includes(change.oldString)) {
           const preview = change.oldString.slice(0, 80).replace(/\n/g, "\\n");
-          errors.push(
-            `[EDIT 실패] old_string을 찾을 수 없음: ${change.filePath} — "${preview}..."`,
-          );
+          const reason = `old_string을 찾을 수 없음: "${preview}..."`;
+          console.warn(`[BUILDER] EDIT 실패 — ${change.filePath}: ${reason}`);
+          failed.push({ change, reason });
           continue;
         }
 
         const count = current.split(change.oldString).length - 1;
         if (count > 1) {
-          errors.push(
-            `[EDIT 실패] old_string이 ${count}번 존재 — 더 구체적인 old_string 필요: ${change.filePath}`,
-          );
+          const reason = `old_string이 ${count}번 존재 — 더 구체적인 old_string 필요`;
+          console.warn(`[BUILDER] EDIT 실패 — ${change.filePath}: ${reason}`);
+          failed.push({ change, reason });
           continue;
         }
 
         const updated = current.replace(change.oldString, change.newString);
         await fs.promises.writeFile(absPath, updated, "utf-8");
         console.log(`[BUILDER] 수정: ${change.filePath}`);
-        applied++;
+        applied.push(change);
       }
     } catch (err) {
-      errors.push(`[파일 오류] ${change.filePath}: ${err.message}`);
+      failed.push({ change, reason: err.message });
     }
   }
 
-  return { applied, errors };
+  return { applied, failed };
 }
 
 /**

@@ -5,7 +5,7 @@ const path = require("path");
 const { CONFIG } = require("./config");
 const { MESSAGES } = require("./messages");
 const { run, ensureRepo, switchToBranch } = require("./git");
-const { CHAT_SYSTEM_PROMPT } = require("../wizkey-prompt");
+const { TALK_SYSTEM_PROMPT, ASK_SYSTEM_PROMPT } = require("../wizkey-prompt");
 const { threadBranchMap, saveThreadMap } = require("./thread-map");
 const { enqueueRequest, getQueueLength } = require("./queue");
 const {
@@ -18,6 +18,7 @@ const {
   classifyMessage,
   generateTmi,
   summarizeChanges,
+  verifyChanges,
 } = require("./classifier");
 const { collectFileTree, identifyRelevantFiles, readFiles } = require("./file-analyzer");
 const { fetchFigmaData } = require("./figma");
@@ -37,9 +38,12 @@ async function addReaction(channel, timestamp, name) {
 async function getUserName(userId) {
   try {
     const result = await slackClient.users.info({ user: userId });
-    return result.user.profile.display_name || result.user.real_name || null;
+    const profile = result.user.profile || {};
+    const name = profile.display_name || profile.real_name || result.user.real_name || result.user.name || null;
+    console.log(`[USER] 이름 조회 성공: ${userId} → ${name}`);
+    return name;
   } catch (err) {
-    console.warn("[USER] 이름 가져오기 실패:", err.message);
+    console.warn(`[USER] 이름 가져오기 실패 (${userId}):`, err.message);
     return null;
   }
 }
@@ -56,7 +60,26 @@ async function processRequest(message, say, threadTs, channel, messageTs, userId
   const category = await classifyMessage(message);
   console.log(`[CLASSIFIER] 결과: ${category}`);
 
-  if (category === "chat") {
+  if (category === "talk") {
+    try {
+      const { callHaiku } = require("./claude");
+      let prompt = message;
+      if (userName) {
+        prompt = `사용자 이름: ${userName}\n\n${prompt}`;
+      }
+      const answer = await callHaiku(TALK_SYSTEM_PROMPT, prompt);
+      await say({ text: truncateForSlack(answer, 2000), thread_ts: threadTs });
+    } catch (err) {
+      console.error("[TALK] 답변 생성 실패:", err.message);
+      await say({
+        text: "답변 생성 중 오류가 발생했어요. 다시 시도해주세요!",
+        thread_ts: threadTs,
+      });
+    }
+    return;
+  }
+
+  if (category === "ask") {
     try {
       await ensureRepo();
       const threadData = threadBranchMap.get(threadTs);
@@ -64,13 +87,11 @@ async function processRequest(message, say, threadTs, channel, messageTs, userId
         await switchToBranch(threadData.branchName);
       }
 
-      // 파일 트리 수집 → 관련 파일 특정 → 읽기
       const repoPath = CONFIG.repo.path;
       const fileTree = collectFileTree(repoPath);
       const relevantPaths = await identifyRelevantFiles(message, fileTree, null);
       const fileContents = readFiles(relevantPaths, repoPath);
 
-      // Haiku에게 파일 내용 + 질문 전달
       const { callHaiku } = require("./claude");
       let prompt = message;
       if (fileContents.length > 0) {
@@ -82,10 +103,10 @@ async function processRequest(message, say, threadTs, channel, messageTs, userId
       if (userName) {
         prompt = `사용자 이름: ${userName}\n\n${prompt}`;
       }
-      const answer = await callHaiku(CHAT_SYSTEM_PROMPT, prompt);
+      const answer = await callHaiku(ASK_SYSTEM_PROMPT, prompt);
       await say({ text: truncateForSlack(answer, 2000), thread_ts: threadTs });
     } catch (err) {
-      console.error("[CHAT] 답변 생성 실패:", err.message);
+      console.error("[ASK] 답변 생성 실패:", err.message);
       await say({
         text: "답변 생성 중 오류가 발생했어요. 다시 시도해주세요!",
         thread_ts: threadTs,
@@ -238,20 +259,53 @@ async function _processCodeRequest(message, say, threadTs, userName) {
       return;
     }
 
-    // 9. 수정안 적용
+    // 9. 수정안 적용 + 실패한 edit 재시도
     console.log(`[BUILDER] 수정안 ${changes.length}건 적용 중...`);
-    const applyResult = await applyChanges(changes, repoPath);
+    let applyResult = await applyChanges(changes, repoPath);
+    let appliedChanges = [...applyResult.applied];
+
     console.log(
-      `[BUILDER] 적용 ${applyResult.applied}건, 에러 ${applyResult.errors.length}건`,
+      `[BUILDER] 적용 ${applyResult.applied.length}건, 실패 ${applyResult.failed.length}건`,
     );
 
-    if (applyResult.errors.length > 0) {
-      for (const err of applyResult.errors) {
-        console.warn(`[BUILDER] ${err}`);
+    // 실패한 edit이 있으면 파일 다시 읽혀서 Sonnet에게 재시도 요청 (최대 2회)
+    if (applyResult.failed.length > 0) {
+      for (let retryAttempt = 1; retryAttempt <= 2; retryAttempt++) {
+        if (applyResult.failed.length === 0) break;
+
+        console.log(`[BUILDER] 실패한 edit 재시도 ${retryAttempt}/2...`);
+        const failedFiles = [...new Set(applyResult.failed.map((f) => f.change.filePath))];
+        const failedFileContents = readFiles(failedFiles, repoPath);
+
+        const failedSummary = applyResult.failed
+          .map((f) => `파일: ${f.change.filePath}\n실패 원인: ${f.reason}\n의도한 수정: old_string을 new_string으로 교체`)
+          .join("\n---\n");
+
+        try {
+          const retryRequest = `아래 edit이 실패했어. 현재 파일 내용을 보고 올바른 old_string으로 다시 수정해줘.\n\n원래 요청: ${message}\n\n## 실패한 수정\n${failedSummary}`;
+          const retryChanges = await generateCodeChanges(
+            retryRequest,
+            failedFileContents,
+            null,
+            context,
+            repoPath,
+          );
+          if (retryChanges.length > 0) {
+            const retryResult = await applyChanges(retryChanges, repoPath);
+            appliedChanges.push(...retryResult.applied);
+            applyResult = { applied: retryResult.applied, failed: retryResult.failed };
+            console.log(`[BUILDER] 재시도 적용 ${retryResult.applied.length}건, 실패 ${retryResult.failed.length}건`);
+          } else {
+            break;
+          }
+        } catch (err) {
+          console.error("[BUILDER] 재시도 실패:", err.message);
+          break;
+        }
       }
     }
 
-    if (applyResult.applied === 0) {
+    if (appliedChanges.length === 0) {
       await say({
         text: "수정사항을 적용하지 못했어요. 다시 시도해주세요.",
         thread_ts: threadTs,
@@ -261,7 +315,46 @@ async function _processCodeRequest(message, say, threadTs, userName) {
       return;
     }
 
-    // 10. 빌드 검증 + 재시도 루프 (최대 3회)
+    // 10. 요청 대비 구현 완료 검증 (실제 적용된 changes 기준, 최대 2회 보완)
+    for (let verifyAttempt = 1; verifyAttempt <= 2; verifyAttempt++) {
+      console.log(`[VERIFY] 검증 시도 ${verifyAttempt}/2...`);
+      const verification = await verifyChanges(message, appliedChanges);
+      if (verification.passed) {
+        console.log("[VERIFY] 검증 통과");
+        break;
+      }
+
+      console.log(`[VERIFY] 누락 발견: ${verification.missing}`);
+      if (verifyAttempt >= 2) {
+        console.log("[VERIFY] 보완 횟수 초과, 현재 상태로 진행");
+        break;
+      }
+
+      // 누락 사항을 Sonnet에게 보완 요청 — 현재 파일 상태를 다시 읽어서 전달
+      console.log("[CODE-GEN] 누락 사항 보완 요청 중...");
+      const appliedPaths = appliedChanges.map((c) => c.filePath);
+      const allPaths = [...new Set([...relevantPaths, ...appliedPaths])];
+      const currentFiles = readFiles(allPaths, repoPath);
+      try {
+        const supplementRequest = `원래 요청: ${message}\n\n이미 수정된 파일: ${appliedPaths.join(", ")}\n\n누락된 작업: ${verification.missing}\n\n누락된 부분만 추가로 구현해줘.`;
+        const additionalChanges = await generateCodeChanges(
+          supplementRequest,
+          currentFiles,
+          figmaData,
+          context,
+          repoPath,
+        );
+        if (additionalChanges.length > 0) {
+          const addResult = await applyChanges(additionalChanges, repoPath);
+          appliedChanges.push(...addResult.applied);
+          console.log(`[VERIFY] 보완 적용 ${addResult.applied.length}건, 실패 ${addResult.failed.length}건`);
+        }
+      } catch (err) {
+        console.error("[VERIFY] 보완 실패:", err.message);
+      }
+    }
+
+    // 11. 빌드 검증 + 재시도 루프 (최대 3회)
     let buildResult;
     for (let attempt = 1; attempt <= 3; attempt++) {
       console.log(`[BUILDER] 빌드 시도 ${attempt}/3...`);
@@ -270,8 +363,9 @@ async function _processCodeRequest(message, say, threadTs, userName) {
 
       if (attempt < 3) {
         console.log("[CODE-GEN] 빌드 에러 수정 요청 중...");
-        // 현재 파일 상태를 다시 읽어서 전달
-        const currentFiles = readFiles(relevantPaths, repoPath);
+        const appliedPaths = appliedChanges.map((c) => c.filePath);
+        const allPaths = [...new Set([...relevantPaths, ...appliedPaths])];
+        const currentFiles = readFiles(allPaths, repoPath);
         try {
           const fixes = await fixBuildError(
             buildResult.stderr,
@@ -279,7 +373,8 @@ async function _processCodeRequest(message, say, threadTs, userName) {
             repoPath,
           );
           if (fixes.length > 0) {
-            await applyChanges(fixes, repoPath);
+            const fixResult = await applyChanges(fixes, repoPath);
+            appliedChanges.push(...fixResult.applied);
           }
         } catch (err) {
           console.error("[CODE-GEN] 빌드 에러 수정 실패:", err.message);
@@ -297,9 +392,9 @@ async function _processCodeRequest(message, say, threadTs, userName) {
       return;
     }
 
-    // 11. git commit + push
+    // 12. git commit + push
     console.log("[GIT] 커밋 & 푸시 중...");
-    const changedFiles = changes.map((c) => c.filePath);
+    const changedFiles = [...new Set(appliedChanges.map((c) => c.filePath))];
     try {
       await run(`git add ${changedFiles.map((f) => `"${f}"`).join(" ")}`, repoPath);
     } catch {
@@ -323,28 +418,36 @@ async function _processCodeRequest(message, say, threadTs, userName) {
     await run(`git push origin ${branchName}`, repoPath);
     const pushTimestamp = Date.now();
 
-    // 12. 스레드 데이터 업데이트
+    // 13. 스레드 데이터 업데이트
     threadData.hasCommit = true;
     threadData.changes.push(
-      changes
+      appliedChanges
         .map((c) => `${c.type}: ${c.filePath}`)
         .join("\n")
         .slice(0, 500),
     );
     saveThreadMap(threadBranchMap);
 
-    // 13. Vercel 프리뷰 URL 대기
+    // 14. Vercel 프리뷰 URL 대기
     await say({ text: MESSAGES.VERCEL_WAITING, thread_ts: threadTs });
     const vercelUrl = await waitForVercelDeployment(branchName, pushTimestamp);
 
-    // 14. 결과 요약 생성
-    const changeSummary = changes
-      .map((c) => `${c.type === "create" ? "생성" : "수정"}: ${c.filePath}`)
-      .join("\n");
+    // 15. 결과 요약 생성 (파일 경로 + 변경 내용 포함)
+    const changeSummary = appliedChanges
+      .map((c) => {
+        if (c.type === "create") {
+          const preview = (c.content || "").slice(0, 200);
+          return `생성: ${c.filePath}\n내용 미리보기: ${preview}`;
+        } else {
+          return `수정: ${c.filePath}\n이전: ${(c.oldString || "").slice(0, 100)}\n이후: ${(c.newString || "").slice(0, 100)}`;
+        }
+      })
+      .join("\n---\n");
+    const summaryInput = `## 원래 요청\n${message}\n\n## 변경 내역\n${changeSummary}`;
     const summary =
-      (await summarizeChanges(changeSummary)) || changeSummary;
+      (await summarizeChanges(summaryInput)) || changeSummary;
 
-    // 15. 슬랙 응답
+    // 16. 슬랙 응답
     const statusEmoji = isFollowUp ? "🔄" : "✅";
     const namePrefix = userName ? `${userName}님, ` : "";
     const statusText = isFollowUp ? `${namePrefix}추가 수정 완료!` : `${namePrefix}수정 완료!`;
