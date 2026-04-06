@@ -166,7 +166,29 @@ async function generateCodeChanges(
   const failedChanges = [];
 
   const userMessage = buildUserMessage(request, fileContents, figmaData, context);
-  const messages = [{ role: "user", content: userMessage }];
+
+  // 이미지가 있으면 multimodal content 구성
+  let firstMessageContent;
+  if (context?.images && context.images.length > 0) {
+    firstMessageContent = [];
+    // 이미지 먼저
+    for (const img of context.images) {
+      firstMessageContent.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: img.mediaType,
+          data: img.base64,
+        },
+      });
+    }
+    // 텍스트 뒤에
+    firstMessageContent.push({ type: "text", text: userMessage });
+  } else {
+    firstMessageContent = userMessage;
+  }
+
+  const messages = [{ role: "user", content: firstMessageContent }];
 
   let iterations = 0;
 
