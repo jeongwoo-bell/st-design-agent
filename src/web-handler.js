@@ -15,7 +15,10 @@ const { generateCodeChanges, fixBuildError } = require("./code-generator");
 const { applyChanges, runBuild, revertChanges } = require("./builder");
 const { buildDocsContext } = require("./docs-reader");
 const { callHaiku, callHaikuStream } = require("./claude");
-const { findOrCreateConversation, saveMessage, updateConversation } = require("./database");
+const { findOrCreateConversation, saveMessage, updateConversation, updateProcessingStatus, getConversationMessages } = require("./database");
+
+// 대화별 이미지 캐시 — 같은 대화에서 후속 메시지가 이전 이미지를 참조할 수 있도록
+const conversationImageCache = new Map(); // conversationId → images[]
 
 /**
  * 메시지 처리 — 분류 후 분기
@@ -28,36 +31,103 @@ const { findOrCreateConversation, saveMessage, updateConversation } = require(".
  * @param {function} emit - 실시간 이벤트 전송 (type, data)
  * @returns {object} 응답 결과
  */
-async function handleRequest({ message, threadId, figmaUrl, userName, chatHistory, deviceId, images }, emit) {
-  const threadHistory = chatHistory ? chatHistory.join("\n") : null;
+async function handleRequest(params, emit) {
+  let _convId = null;
+  try {
+    return await _handleRequestInner(params, emit, (id) => { _convId = id; });
+  } finally {
+    // 어떤 경로든 처리 완료 시 processing 해제
+    if (_convId) updateProcessingStatus(_convId, null);
+  }
+}
+
+async function _handleRequestInner({ message, threadId, figmaUrl, userName, chatHistory, userId, images }, emit, setConvId) {
+  // 빈 메시지 보정
+  message = message || "";
 
   // DB: 대화 찾기/생성 + 유저 메시지 저장
-  const effectiveDeviceId = deviceId || "anonymous";
-  const conversation = findOrCreateConversation(effectiveDeviceId, threadId);
-  saveMessage({ conversationId: conversation.id, role: "user", content: message, type: null, metadata: { figmaUrl, userName } });
+  const conversation = findOrCreateConversation(userId, threadId);
+
+  // 대화 히스토리 — DB에서 직접 읽어서 메타데이터(브랜치, 파일 등)까지 포함
+  const dbMessages = getConversationMessages(conversation.id);
+  let threadHistory = null;
+  if (dbMessages.length > 0) {
+    threadHistory = dbMessages.map((m) => {
+      const role = m.role === "user" ? "사용자" : "봇";
+      let line = `${role}: ${m.content}`;
+      // 봇의 수정 결과 메타데이터 포함
+      if (m.role === "assistant" && m.metadata) {
+        if (m.metadata.branchName) line += `\n[브랜치: ${m.metadata.branchName}]`;
+        if (m.metadata.changedFiles?.length) line += `\n[수정 파일: ${m.metadata.changedFiles.join(", ")}]`;
+        if (m.metadata.previewUrl) line += `\n[프리뷰: ${m.metadata.previewUrl}]`;
+      }
+      return line;
+    }).join("\n\n");
+  }
+  setConvId(conversation.id);
+  saveMessage({ conversationId: conversation.id, role: "user", content: message || "", type: null, metadata: { figmaUrl, userName, hasImages: !!(images && images.length > 0), imageCount: images?.length || 0 } });
+
+  // 처리 상태 추적 — DB에 저장해서 새로고침 후에도 복원 가능
+  const processingSteps = [];
+  const _originalEmit = emit;
+  emit = (type, data) => {
+    _originalEmit(type, data);
+    if ((type === "progress" || type === "status") && data?.step) {
+      const existing = processingSteps.find((s) => s.step === data.step);
+      if (existing) Object.assign(existing, data);
+      else processingSteps.push({ ...data });
+      updateProcessingStatus(conversation.id, { processing: true, steps: processingSteps });
+    }
+  };
+  // 시작 표시
+  updateProcessingStatus(conversation.id, { processing: true, steps: [] });
+
+  // 이미지 캐시 — 새 이미지가 오면 저장, 없으면 이전 이미지 사용
+  if (images && images.length > 0) {
+    conversationImageCache.set(conversation.id, images);
+    console.log(`[IMG] 이미지 캐시 저장: conv:${conversation.id.slice(0, 8)} → ${images.length}장`);
+  }
+  const cachedImages = conversationImageCache.get(conversation.id) || null;
 
   // 분류
   emit("status", { step: "classify", state: "start" });
-  const category = await classifyMessage(message, threadHistory);
+  const hasImages = (images && images.length > 0);
+  const hasCachedImages = !!cachedImages;
+  const hasText = message && message.trim().length > 0;
+  let category;
+  if (hasImages && hasText) {
+    // 이미지 + 텍스트 → 텍스트 기반 분류 (대부분 code)
+    category = await classifyMessage(message, threadHistory);
+  } else if (hasImages && !hasText) {
+    // 이미지만 → 뭘 해달라는 건지 되물어보기
+    category = "unclear";
+  } else {
+    category = await classifyMessage(message, threadHistory);
+  }
   console.log(`[CLASSIFIER] 결과: ${category}`);
   emit("status", { step: "classify", state: "done", result: category });
 
+  // 현재 요청의 이미지 또는 캐시된 이미지
+  const effectiveImages = hasImages ? images : cachedImages;
+
   if (category === "talk") {
-    const result = await _handleTalk(message, userName, threadHistory, emit);
+    const result = await _handleTalk(message, userName, threadHistory, emit, effectiveImages);
     saveMessage({ conversationId: conversation.id, role: "assistant", content: result.message, type: "talk" });
     if (!conversation.title) updateConversation(conversation.id, { title: message.slice(0, 100) });
     return { ...result, threadId: conversation.thread_id };
   }
 
   if (category === "ask") {
-    const result = await _handleAsk(message, userName, threadHistory, threadId, emit);
+    const result = await _handleAsk(message, userName, threadHistory, threadId, emit, effectiveImages);
     saveMessage({ conversationId: conversation.id, role: "assistant", content: result.message, type: "ask" });
     if (!conversation.title) updateConversation(conversation.id, { title: message.slice(0, 100) });
     return { ...result, threadId: conversation.thread_id };
   }
 
   if (category === "unclear") {
-    const msg = "요청을 이해하지 못했어요. 좀 더 구체적으로 말씀해주세요.";
+    const msg = hasImages
+      ? "이미지를 확인했어요! 어떻게 도와드릴까요?\n\n예시:\n• \"이 디자인대로 구현해줘\"\n• \"이 부분의 색상을 바꿔줘\"\n• \"이 레이아웃을 참고해서 수정해줘\""
+      : "요청을 이해하지 못했어요. 좀 더 구체적으로 말씀해주세요.";
     saveMessage({ conversationId: conversation.id, role: "assistant", content: msg, type: "unclear" });
     return { type: "unclear", message: msg, threadId: conversation.thread_id };
   }
@@ -95,7 +165,7 @@ async function handleRequest({ message, threadId, figmaUrl, userName, chatHistor
           threadHistory,
           emit,
           conversationId: conversation.id,
-          images,
+          images: effectiveImages,
         });
         resolve(result);
       } catch (err) {
@@ -106,19 +176,33 @@ async function handleRequest({ message, threadId, figmaUrl, userName, chatHistor
   });
 }
 
+/** 이미지가 있으면 multimodal content 배열, 없으면 텍스트 */
+function buildMessageContent(textPrompt, images) {
+  if (!images || images.length === 0) return textPrompt;
+  const content = [];
+  for (const img of images) {
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: img.mediaType, data: img.base64 },
+    });
+  }
+  content.push({ type: "text", text: textPrompt });
+  return content;
+}
+
 /** talk 처리 */
-async function _handleTalk(message, userName, threadHistory, emit) {
+async function _handleTalk(message, userName, threadHistory, emit, images) {
   let prompt = message;
   if (threadHistory) prompt = `## 이전 대화\n${threadHistory}\n\n## 현재 메시지\n${prompt}`;
   if (userName) prompt = `사용자 이름: ${userName}\n\n${prompt}`;
-  const answer = await callHaikuStream(TALK_SYSTEM_PROMPT, prompt, (chunk) => {
+  const answer = await callHaikuStream(TALK_SYSTEM_PROMPT, buildMessageContent(prompt, images), (chunk) => {
     emit("stream", { delta: chunk });
   });
   return { type: "talk", message: answer };
 }
 
 /** ask 처리 */
-async function _handleAsk(message, userName, threadHistory, threadId, emit) {
+async function _handleAsk(message, userName, threadHistory, threadId, emit, images) {
   await ensureRepo();
 
   // 기존 브랜치가 있으면 해당 브랜치에서 코드 읽기
@@ -142,7 +226,7 @@ async function _handleAsk(message, userName, threadHistory, threadId, emit) {
   if (threadHistory) prompt = `## 이전 대화\n${threadHistory}\n\n${prompt}`;
   if (userName) prompt = `사용자 이름: ${userName}\n\n${prompt}`;
 
-  const answer = await callHaikuStream(ASK_SYSTEM_PROMPT, prompt, (chunk) => {
+  const answer = await callHaikuStream(ASK_SYSTEM_PROMPT, buildMessageContent(prompt, images), (chunk) => {
     emit("stream", { delta: chunk });
   });
   await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
@@ -304,7 +388,12 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
   }
   emit("progress", { step: "build", state: "done" });
 
+  // 빌드 성공 시점을 임시 커밋으로 저장 — 보완 실패 시 여기로 복원
+  await run("git add -A", repoPath);
+  await run('git commit -m "__checkpoint: build passed"', repoPath).catch(() => {});
+
   // 7. 검증 (빌드 성공 후 — 실제 디스크 상태 기반)
+  const appliedBeforeVerify = [...appliedChanges];
   for (let v = 1; v <= 2; v++) {
     const verification = await verifyChanges(message, appliedChanges, repoPath);
     if (verification.passed) break;
@@ -323,17 +412,39 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
       // 보완 후 빌드 재확인
       const rebuildResult = await runBuild(repoPath);
       if (!rebuildResult.success) {
-        console.warn("[VERIFY] 보완 후 빌드 실패 — 보완 건너뜀");
-        await revertChanges(repoPath);
-        // 보완 전 상태로 복원 (원본 변경만 다시 적용)
+        console.warn("[VERIFY] 보완 후 빌드 실패 — 체크포인트로 복원");
+        // 보완분만 되돌리기 — 체크포인트 커밋으로 리셋
+        await run("git reset --hard HEAD", repoPath);
+        appliedChanges.length = 0;
+        appliedChanges.push(...appliedBeforeVerify);
         break;
       }
-    } catch {}
+    } catch {
+      // 보완 생성 자체 실패 — 원본 유지
+      await run("git reset --hard HEAD", repoPath).catch(() => {});
+      appliedChanges.length = 0;
+      appliedChanges.push(...appliedBeforeVerify);
+      break;
+    }
   }
+
+  // 체크포인트 커밋을 언커밋 (변경사항은 유지, 커밋만 제거 — 나중에 진짜 커밋으로 교체)
+  await run("git reset --soft HEAD~1", repoPath).catch(() => {});
 
   // 9. git push
   emit("progress", { step: "push", state: "start" });
   const changedFiles = [...new Set(appliedChanges.map((c) => c.filePath))];
+
+  // 변경사항 없으면 커밋 스킵
+  const gitStatus = await run("git status --porcelain", repoPath).catch(() => "");
+  if (!gitStatus.trim()) {
+    console.warn("[GIT] 변경사항 없음 — 커밋 스킵");
+    emit("progress", { step: "push", state: "done" });
+    await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+    saveMessage({ conversationId, role: "assistant", content: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", type: "no_changes" });
+    return { type: "no_changes", message: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", threadId };
+  }
+
   try {
     await run(`git add ${changedFiles.map((f) => `"${f}"`).join(" ")}`, repoPath);
   } catch {

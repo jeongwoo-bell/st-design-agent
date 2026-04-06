@@ -25,11 +25,13 @@ async function callHaiku(systemPrompt, userMessage) {
  * @returns {string} 전체 응답 텍스트
  */
 async function callHaikuStream(systemPrompt, userMessage, onChunk) {
+  // userMessage가 문자열이면 그대로, 배열이면 multimodal content
+  const content = typeof userMessage === 'string' ? userMessage : userMessage;
   const stream = client.messages.stream({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 2048,
     system: systemPrompt,
-    messages: [{ role: "user", content: userMessage }],
+    messages: [{ role: "user", content }],
   });
 
   let fullText = "";
