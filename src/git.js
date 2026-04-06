@@ -73,4 +73,31 @@ async function switchToBranch(branchName, createNew = false) {
   }
 }
 
-module.exports = { run, ensureRepo, switchToBranch };
+async function ensureDocsRepo() {
+  if (!CONFIG.docs.url) return false;
+
+  const docsUrl = CONFIG.github.token
+    ? CONFIG.docs.url.replace("https://", `https://${CONFIG.github.token}@`)
+    : CONFIG.docs.url;
+
+  try {
+    if (!fs.existsSync(CONFIG.docs.path)) {
+      console.log("[DOCS] docs 레포 클론 중...");
+      await run(`git clone ${docsUrl} ${CONFIG.docs.path}`, "/tmp");
+    } else if (fs.existsSync(path.join(CONFIG.docs.path, ".git"))) {
+      console.log("[DOCS] docs 레포 pull 중...");
+      await run(`git checkout ${CONFIG.docs.branch}`, CONFIG.docs.path);
+      await run(`git pull origin ${CONFIG.docs.branch}`, CONFIG.docs.path);
+    } else {
+      await run(`rm -rf ${CONFIG.docs.path}`, "/tmp");
+      await run(`git clone ${docsUrl} ${CONFIG.docs.path}`, "/tmp");
+    }
+    console.log("[DOCS] docs 레포 준비 완료");
+    return true;
+  } catch (err) {
+    console.error("[DOCS] docs 레포 준비 실패:", err.message);
+    return false;
+  }
+}
+
+module.exports = { run, ensureRepo, ensureDocsRepo, switchToBranch };

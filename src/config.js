@@ -17,10 +17,23 @@ const CONFIG = {
   figma: {
     apiKey: process.env.FIGMA_API_KEY || null,
   },
+  docs: {
+    url: process.env.DOCS_REPO_URL || null,
+    path: process.env.DOCS_REPO_PATH || "/tmp/design-bot-docs",
+    branch: process.env.DOCS_REPO_BRANCH || "main",
+  },
   vercel: {
     token: process.env.VERCEL_TOKEN || null,
     projectId: process.env.VERCEL_PROJECT_ID || null,
     teamId: process.env.VERCEL_TEAM_ID || null,
+  },
+  jira: {
+    host: process.env.JIRA_HOST || null,
+    email: process.env.JIRA_EMAIL || null,
+    apiToken: process.env.JIRA_API_TOKEN || null,
+    projectKeys: process.env.JIRA_PROJECT_KEY
+      ? process.env.JIRA_PROJECT_KEY.split(",").map((k) => k.trim())
+      : [],
   },
   allowedChannel: process.env.ALLOWED_CHANNEL_ID || null,
   slackMaxLength: 3000,

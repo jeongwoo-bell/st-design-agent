@@ -59,8 +59,16 @@ const TOOLS = [
 function buildUserMessage(request, fileContents, figmaData, context) {
   let msg = "";
 
+  if (context?.threadHistory) {
+    msg += `## 슬랙 스레드 대화 맥락\n${context.threadHistory}\n\n---\n\n`;
+  }
+
   if (context?.isFollowUp && context?.previousChanges) {
     msg += `## 이전 수정 이력 (같은 스레드, 같은 브랜치)\n${context.previousChanges}\n\n---\n\n`;
+  }
+
+  if (context?.docsContext) {
+    msg += `${context.docsContext}\n\n---\n\n`;
   }
 
   msg += `## 디자이너 요청\n${request}\n\n`;
