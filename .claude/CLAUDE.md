@@ -1,65 +1,68 @@
 # st-design-agent
 
-SleepThera 랜딩페이지를 위한 **슬랙 기반 디자인 봇**. 디자이너가 슬랙에서 @멘션으로 UI 수정을 요청하면, AI가 코드를 자동으로 수정하고 빌드 검증 후 Vercel 프리뷰까지 제공한다.
+SleepThera 랜딩페이지를 위한 **AI 디자인 에이전트**. 사용자가 UI 수정을 요청하면, AI가 스펙 문서를 참조하여 코드를 자동으로 수정하고 빌드 검증 후 Vercel 프리뷰까지 제공한다.
+
+## 실행 모드
+
+| 모드 | 엔트리포인트 | 설명 |
+|------|-------------|------|
+| 슬랙 봇 | `node --env-file=.env bot.js` | 슬랙 @멘션 기반 (기존) |
+| 웹 API | `node --env-file=.env server.js` | REST + WebSocket (신규) |
+
+## 웹 API (server.js)
+
+```
+POST /api/request   { message, threadId?, figmaUrl?, userName?, chatHistory? }
+GET  /api/health    헬스 체크
+WS   ws://host:3001 실시간 진행상황 (subscribe → progress → complete)
+```
+
+프론트엔드 레포: `Sleep-agent-front` (별도 레포)
 
 ## 동작 방식
 
-1. 슬랙 메시지 수신 → Haiku로 분류 (code / chat / unclear)
+1. 메시지 수신 → Haiku로 분류 (code / ask / talk / ticket / unclear)
 2. `code` 요청 시:
    - docs 레포에서 관련 스펙 문서 조회 (`docs-reader.js`)
    - 스펙 기반 구현 여부 확인 → 이미 구현됐으면 스킵, 부분/미구현이면 진행
    - Haiku로 관련 파일 특정 (`file-analyzer.js`)
-   - Sonnet으로 코드 수정안 생성 (`code-generator.js`, tool use 멀티턴) — docs 스펙을 컨텍스트에 포함
+   - Sonnet으로 코드 수정안 생성 (`code-generator.js`, tool use 멀티턴) — docs 스펙 + 피그마 컨텍스트 포함
    - 파일 적용 → `pnpm build` 검증 (실패 시 최대 3회 재시도) (`builder.js`)
-   - git commit & push → Vercel 배포 대기 → 슬랙 응답
-3. `chat` 요청 시: Haiku가 기술 질문에 답변
-4. 스레드 내 후속 메시지는 같은 브랜치에서 이어서 작업
-5. `/pr` 명령으로 Draft PR 생성
-
-## 이 봇이 수정하는 대상 레포
-
-- **SleepThera 랜딩페이지** (Next.js + TypeScript + Tailwind CSS)
-- 환경변수 `REPO_URL`로 지정, `REPO_PATH` (기본 `/tmp/design-bot-repo`)에 클론
-- 이 레포 자체는 봇 코드이며, 랜딩페이지 코드가 아님
+   - git commit & push → Vercel 배포 대기 → 응답
+3. `ask` 요청 시: 코드 읽고 기술 질문에 답변
+4. `talk` 요청 시: 일반 대화
+5. 후속 메시지는 같은 브랜치에서 이어서 작업 (threadId 기반)
 
 ## 아키텍처
 
 ```
-bot.js                  # 엔트리포인트
+bot.js                  # 슬랙 봇 엔트리포인트
+server.js               # 웹 API 엔트리포인트 (Express + WebSocket)
 wizkey-prompt.js        # Sonnet/Haiku 시스템 프롬프트
 src/
-├── slack.js            # Slack Bolt 이벤트 핸들러 (멘션, 스레드 메시지)
-├── handler.js          # 오케스트레이터 (전체 흐름 제어, 핵심 파일)
-├── classifier.js       # Haiku: 메시지 분류, TMI 생성, 변경 요약
+├── web-handler.js      # 웹 API용 오케스트레이터 (슬랙/JIRA 의존성 없음)
+├── handler.js          # 슬랙 봇용 오케스트레이터
+├── classifier.js       # Haiku: 메시지 분류 + 변경 요약 + 검증 + 티켓 매칭
 ├── file-analyzer.js    # 파일 트리 수집 + Haiku로 관련 파일 특정
 ├── code-generator.js   # Sonnet: tool use로 코드 수정안 생성 (멀티턴)
 ├── builder.js          # 파일 적용 + pnpm build 검증 + revert
-├── figma.js            # Figma REST API로 디자인 스펙 추출
-├── git.js              # git 명령 실행 (clone, branch, commit, push)
-├── vercel.js           # Vercel API 폴링으로 프리뷰 URL 확보
-├── parser.js           # 유틸: 슬랙 텍스트 잘라내기, 브랜치명 생성, 피그마 링크 감지
-├── classifier.js       # Haiku: 메시지 분류 + TMI + 변경 요약
 ├── docs-reader.js      # docs 레포 스펙 읽기 + 관련 스펙 매칭 + 구현 여부 판단
+├── figma.js            # Figma REST API로 디자인 스펙 추출
+├── git.js              # git 명령 실행 (clone, branch, commit, push, docs 레포 관리)
+├── claude.js           # Anthropic SDK 래퍼 (callHaiku, callSonnet)
+├── vercel.js           # Vercel API 폴링으로 프리뷰 URL 확보
+├── parser.js           # 유틸: 텍스트 잘라내기, 브랜치명 생성, 피그마 링크 감지
+├── bot-guide.js        # 봇 기능 가이드 (프롬프트에서 공통 참조)
 ├── config.js           # 환경변수 → CONFIG 객체
-├── messages.js         # 슬랙 응답 메시지 템플릿
-├── thread-map.js       # 스레드 ↔ 브랜치 매핑 (메모리 + 파일 persist)
+├── messages.js         # 응답 메시지 템플릿
+├── thread-map.js       # 스레드/대화 ↔ 브랜치 매핑 (파일 persist)
 └── queue.js            # 요청 큐 (동시 처리 방지)
 ```
-
-## 기술 스택
-
-- **런타임**: Node.js (CommonJS)
-- **슬랙**: @slack/bolt (Socket Mode)
-- **AI**: @anthropic-ai/sdk — Haiku (분류/분석), Sonnet (코드 수정)
-- **빌드 검증**: 대상 레포에서 `pnpm build` 실행
-- **배포**: Vercel API로 프리뷰 URL 폴링
 
 ## 환경변수
 
 | 변수 | 필수 | 용도 |
 |---|---|---|
-| `SLACK_BOT_TOKEN` | O | 슬랙 봇 토큰 |
-| `SLACK_APP_TOKEN` | O | 슬랙 앱 토큰 (Socket Mode) |
 | `ANTHROPIC_API_KEY` | O | Claude API 키 |
 | `REPO_URL` | O | 대상 레포 Git URL |
 | `REPO_BRANCH` | - | 기본 브랜치 (기본값: develop) |
@@ -72,27 +75,27 @@ src/
 | `DOCS_REPO_URL` | - | 스펙 문서 레포 Git URL |
 | `DOCS_REPO_PATH` | - | docs 레포 클론 경로 (기본값: /tmp/design-bot-docs) |
 | `DOCS_REPO_BRANCH` | - | docs 레포 브랜치 (기본값: main) |
-| `ALLOWED_CHANNEL_ID` | - | 특정 채널만 허용 |
+| `PORT` | - | 웹 API 포트 (기본값: 3001) |
 
-## 핵심 흐름 (handler.js)
+## 핵심 흐름 (web-handler.js)
 
-`_processCodeRequest()` 가 전체 파이프라인:
-1. 스레드-브랜치 매핑 → 브랜치 생성/전환
+`_processCodeRequest()` 파이프라인:
+1. 브랜치 생성/전환
 2. 피그마 데이터 (있으면)
-3. `collectFileTree()` → `identifyRelevantFiles()` → `readFiles()`
+3. 파일 트리 → 관련 파일 특정 → 읽기
 4. **`buildDocsContext()`** — docs 레포에서 관련 스펙 찾기 → 구현 여부 판단
-   - `implemented` → 슬랙에 알리고 종료
-   - `partial` → 미구현 부분만 Sonnet에 전달
-   - `not_implemented` → 전체 스펙 Sonnet에 전달
-   - docs 없거나 실패 → 기존 방식 fallback
-5. `generateCodeChanges()` — Sonnet이 tool use로 edit_file/create_file 반환 (docs 컨텍스트 포함)
-6. `applyChanges()` — 파일 시스템에 적용
-7. `runBuild()` — 실패 시 `fixBuildError()`로 재시도 (최대 3회)
-8. git add/commit/push → Vercel 프리뷰 대기 → 슬랙 응답
+5. `generateCodeChanges()` — Sonnet tool use (docs + 피그마 컨텍스트 포함)
+6. `applyChanges()` + 재시도
+7. `verifyChanges()` — 누락 검증
+8. `runBuild()` — 실패 시 재시도 (최대 3회)
+9. git push → Vercel 프리뷰 대기
+
+진행상황은 `emit()` 콜백으로 WebSocket에 실시간 전송.
 
 ## 주의사항
 
-- `handler.js`가 가장 복잡하고 중요한 파일. 흐름 변경 시 주의
-- 빌드 재시도 시 새로 생성된 파일도 컨텍스트에 포함해야 함 (기존 버그 수정됨)
+- `web-handler.js`는 슬랙/JIRA 의존성 없이 독립 동작
+- `handler.js`(슬랙용)와 `web-handler.js`(웹용)는 같은 핵심 모듈을 공유
+- 빌드 재시도 시 새로 생성된 파일도 컨텍스트에 포함해야 함
 - `code-generator.js`의 tool use 멀티턴: read_file 요청 시 파일을 읽어 tool_result로 전달
 - 커밋 시 `changes` 배열의 파일만 git add — fixBuildError 수정분도 포함해야 함

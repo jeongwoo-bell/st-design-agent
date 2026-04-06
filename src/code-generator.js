@@ -5,6 +5,10 @@ const fs = require("fs");
 const path = require("path");
 const { callSonnet } = require("./claude");
 const { WIZKEY_SYSTEM_PROMPT } = require("../wizkey-prompt");
+const { applyChanges } = require("./builder");
+
+// 토큰 안전장치: 1토큰 ≈ 4자 기준, Sonnet 200K 한도의 75%
+const MAX_CHAR_BUDGET = 150000 * 4; // 600K자
 
 const TOOLS = [
   {
@@ -55,16 +59,17 @@ const TOOLS = [
 
 /**
  * 유저 메시지 빌드: 요청 + 파일 내용 + 피그마 데이터 + 컨텍스트
+ * 토큰 안전장치 포함
  */
 function buildUserMessage(request, fileContents, figmaData, context) {
   let msg = "";
 
   if (context?.threadHistory) {
-    msg += `## 슬랙 스레드 대화 맥락\n${context.threadHistory}\n\n---\n\n`;
+    msg += `## 대화 맥락\n${context.threadHistory}\n\n---\n\n`;
   }
 
   if (context?.isFollowUp && context?.previousChanges) {
-    msg += `## 이전 수정 이력 (같은 스레드, 같은 브랜치)\n${context.previousChanges}\n\n---\n\n`;
+    msg += `## 이전 수정 이력 (같은 브랜치)\n${context.previousChanges}\n\n---\n\n`;
   }
 
   if (context?.docsContext) {
@@ -77,9 +82,26 @@ function buildUserMessage(request, fileContents, figmaData, context) {
     msg += `## 피그마 디자인 분석 결과\n\`\`\`json\n${JSON.stringify(figmaData.specs, null, 2)}\n\`\`\`\n\n`;
   }
 
+  // 파일 내용 — 토큰 예산 체크하면서 추가
   msg += `## 현재 파일 내용\n\n`;
-  for (const file of fileContents) {
-    msg += `### ${file.path}\n\`\`\`\n${file.content}\n\`\`\`\n\n`;
+  let charBudget = MAX_CHAR_BUDGET - msg.length;
+
+  // 파일을 크기순으로 정렬 (작은 것 먼저 → 최대한 많이 포함)
+  const sortedFiles = [...fileContents].sort((a, b) => a.content.length - b.content.length);
+
+  for (const file of sortedFiles) {
+    const entry = `### ${file.path}\n\`\`\`\n${file.content}\n\`\`\`\n\n`;
+    if (entry.length <= charBudget) {
+      msg += entry;
+      charBudget -= entry.length;
+    } else if (charBudget > 1000) {
+      // 예산 부족하면 잘라서라도 포함
+      const truncated = file.content.slice(0, charBudget - 200);
+      msg += `### ${file.path} (일부 — 전체 필요 시 read_file 사용)\n\`\`\`\n${truncated}\n...(truncated)\n\`\`\`\n\n`;
+      charBudget = 0;
+    } else {
+      msg += `### ${file.path} (파일이 너무 커서 생략 — read_file로 요청하세요)\n\n`;
+    }
   }
 
   return msg;
@@ -87,7 +109,6 @@ function buildUserMessage(request, fileContents, figmaData, context) {
 
 /**
  * Sonnet 응답에서 tool_use 호출을 파싱
- * @returns {{ changes: Array, readRequests: Array, textResponse: string }}
  */
 function parseToolCalls(response) {
   const changes = [];
@@ -126,10 +147,12 @@ function parseToolCalls(response) {
 }
 
 /**
- * 코드 수정안 생성 (멀티턴: read_file 요청 처리 포함)
+ * 코드 수정안 생성 (멀티턴: 즉시 디스크 적용 + read_file 처리)
  *
- * 대화 컨텍스트를 유지하면서 read_file 요청이 오면 파일을 읽어 tool_result로 전달.
- * 최대 MAX_READBACKS 회까지 반복.
+ * 변경사항은 멀티턴 중 즉시 디스크에 적용됨.
+ * 성공/실패를 tool_result로 Sonnet에 피드백.
+ *
+ * @returns {{ appliedChanges: Array, failedChanges: Array }}
  */
 async function generateCodeChanges(
   request,
@@ -139,7 +162,8 @@ async function generateCodeChanges(
   repoPath,
 ) {
   const MAX_READBACKS = 5;
-  const allChanges = [];
+  const appliedChanges = [];
+  const failedChanges = [];
 
   const userMessage = buildUserMessage(request, fileContents, figmaData, context);
   const messages = [{ role: "user", content: userMessage }];
@@ -147,13 +171,9 @@ async function generateCodeChanges(
   let iterations = 0;
 
   while (iterations <= MAX_READBACKS) {
-    console.log(
-      `[CODE-GEN] Sonnet 호출 (턴 ${iterations + 1})...`,
-    );
+    console.log(`[CODE-GEN] Sonnet 호출 (턴 ${iterations + 1})...`);
     const response = await callSonnet(WIZKEY_SYSTEM_PROMPT, messages, TOOLS);
     const parsed = parseToolCalls(response);
-
-    allChanges.push(...parsed.changes);
 
     if (parsed.textResponse) {
       console.log(`[CODE-GEN:텍스트] ${parsed.textResponse.slice(0, 150)}`);
@@ -162,22 +182,47 @@ async function generateCodeChanges(
       `[CODE-GEN] 수정 ${parsed.changes.length}건, 추가 읽기 요청 ${parsed.readRequests.length}건`,
     );
 
-    // read_file 요청이 없으면 종료
-    if (parsed.readRequests.length === 0) {
+    // read_file도 없고 changes도 없으면 종료
+    if (parsed.readRequests.length === 0 && parsed.changes.length === 0) {
       break;
     }
 
     // 대화 이어가기: assistant 응답을 messages에 추가
     messages.push({ role: "assistant", content: response.content });
 
-    // read_file 요청에 대한 tool_result 생성
     const toolResults = [];
+
+    // edit/create — 즉시 디스크에 적용하고 결과를 tool_result로
+    for (const change of parsed.changes) {
+      const result = await applyChanges([change], repoPath);
+      if (result.applied.length > 0) {
+        appliedChanges.push(change);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: change.toolUseId,
+          content: "적용 완료",
+        });
+        console.log(`[CODE-GEN] ✅ 적용 성공: ${change.filePath}`);
+      } else {
+        failedChanges.push(change);
+        const reason = result.failed[0]?.reason || "알 수 없는 오류";
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: change.toolUseId,
+          content: `적용 실패: ${reason}. 파일의 현재 내용을 read_file로 다시 읽고 올바른 old_string으로 재시도해.`,
+          is_error: true,
+        });
+        console.log(`[CODE-GEN] ❌ 적용 실패: ${change.filePath} — ${reason}`);
+      }
+    }
+
+    // read_file — 디스크에서 읽어서 반환 (이전 턴의 edit가 반영된 최신 상태)
     for (const req of parsed.readRequests) {
       const absPath = path.join(repoPath, req.filePath);
       let fileContent;
       try {
         fileContent = fs.readFileSync(absPath, "utf-8");
-        console.log(`[CODE-GEN] 추가 파일 읽기: ${req.filePath}`);
+        console.log(`[CODE-GEN] 📖 추가 파일 읽기: ${req.filePath}`);
       } catch (err) {
         fileContent = `파일을 읽을 수 없습니다: ${err.message}`;
         console.warn(`[CODE-GEN] 추가 파일 읽기 실패: ${req.filePath}`);
@@ -189,24 +234,19 @@ async function generateCodeChanges(
       });
     }
 
-    // edit_file, create_file에 대한 tool_result도 보내야 함 (성공 확인)
-    for (const change of parsed.changes) {
-      toolResults.push({
-        type: "tool_result",
-        tool_use_id: change.toolUseId,
-        content: "적용 완료",
-      });
-    }
+    // read_file도 changes도 없었으면 (텍스트만) 종료
+    if (toolResults.length === 0) break;
 
     messages.push({ role: "user", content: toolResults });
     iterations++;
   }
 
-  return allChanges;
+  console.log(`[CODE-GEN] 완료 — 적용 ${appliedChanges.length}건, 실패 ${failedChanges.length}건`);
+  return { appliedChanges, failedChanges };
 }
 
 /**
- * 빌드 에러 수정 요청 (기존 대화 컨텍스트 없이 새로운 요청)
+ * 빌드 에러 수정 요청
  */
 async function fixBuildError(errorMessage, fileContents, repoPath) {
   const request = `빌드 에러가 발생했어. 에러를 수정해줘.

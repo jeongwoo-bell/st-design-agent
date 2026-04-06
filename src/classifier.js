@@ -125,21 +125,50 @@ const VERIFY_SYSTEM = `너는 코드 수정 검증기야. 사용자의 요청과
 변경: 수정 src/components/Sections/Section3/index.tsx
 → PASS`;
 
-async function verifyChanges(userRequest, changes) {
+/**
+ * 검증 — 변경된 파일의 **실제 최신 내용**을 디스크에서 읽어서 확인
+ * @param {string} userRequest - 원래 요청
+ * @param {Array} changes - 적용된 변경 목록
+ * @param {string} [repoPath] - 레포 경로 (있으면 파일 내용 확인)
+ */
+async function verifyChanges(userRequest, changes, repoPath) {
   try {
-    const changeSummary = changes
-      .map((c) => {
-        const type = c.type === "create" ? "생성" : "수정";
-        if (c.type === "create") {
-          const preview = (c.content || "").slice(0, 300);
-          return `${type}: ${c.filePath}\n코드 미리보기:\n${preview}`;
-        } else {
-          return `${type}: ${c.filePath}\n이전: ${(c.oldString || "").slice(0, 150)}\n이후: ${(c.newString || "").slice(0, 150)}`;
-        }
-      })
-      .join("\n---\n");
+    const fs = require("fs");
+    const path = require("path");
 
-    const prompt = `## 사용자 요청\n${userRequest}\n\n## 변경 내역\n${changeSummary}`;
+    let changeSummary;
+
+    if (repoPath) {
+      // 변경된 파일의 전체 내용을 디스크에서 읽어서 검증
+      const changedPaths = [...new Set(changes.map((c) => c.filePath))];
+      changeSummary = changedPaths.map((filePath) => {
+        const absPath = path.join(repoPath, filePath);
+        try {
+          const content = fs.readFileSync(absPath, "utf-8");
+          // 파일당 최대 2000자 (기존 300자 → 대폭 확대)
+          const preview = content.slice(0, 2000);
+          const truncated = content.length > 2000 ? "\n...(이하 생략)" : "";
+          return `### ${filePath}\n\`\`\`\n${preview}${truncated}\n\`\`\``;
+        } catch {
+          return `### ${filePath} (파일 읽기 실패)`;
+        }
+      }).join("\n\n");
+    } else {
+      // repoPath 없으면 기존 방식 (changes 배열 기반)
+      changeSummary = changes
+        .map((c) => {
+          const type = c.type === "create" ? "생성" : "수정";
+          if (c.type === "create") {
+            const preview = (c.content || "").slice(0, 2000);
+            return `${type}: ${c.filePath}\n코드:\n${preview}`;
+          } else {
+            return `${type}: ${c.filePath}\n이전: ${(c.oldString || "").slice(0, 500)}\n이후: ${(c.newString || "").slice(0, 500)}`;
+          }
+        })
+        .join("\n---\n");
+    }
+
+    const prompt = `## 사용자 요청\n${userRequest}\n\n## 변경된 파일의 현재 코드\n${changeSummary}`;
 
     const response = await client.messages.create({
       model: "claude-haiku-4-5-20251001",

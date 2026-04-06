@@ -40,15 +40,11 @@ const CONFIG = {
 };
 
 function validateEnv() {
-  const required = [
-    "SLACK_BOT_TOKEN",
-    "SLACK_APP_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "REPO_URL",
-  ];
+  // 웹 모드에서는 슬랙 토큰 불필요
+  const required = ["ANTHROPIC_API_KEY", "REPO_URL"];
   const missing = required.filter((key) => !process.env[key]);
   if (missing.length) {
-    console.error(`❌ 필수 환경변수가 없어요: ${missing.join(", ")}`);
+    console.error(`필수 환경변수가 없어요: ${missing.join(", ")}`);
     process.exit(1);
   }
 }

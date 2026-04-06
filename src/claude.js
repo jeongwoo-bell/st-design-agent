@@ -20,6 +20,29 @@ async function callHaiku(systemPrompt, userMessage) {
 }
 
 /**
+ * Haiku 스트리밍 호출 — talk/ask 응답용
+ * @param {function} onChunk - (textDelta: string) => void
+ * @returns {string} 전체 응답 텍스트
+ */
+async function callHaikuStream(systemPrompt, userMessage, onChunk) {
+  const stream = client.messages.stream({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 2048,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  let fullText = "";
+  stream.on("text", (text) => {
+    fullText += text;
+    if (onChunk) onChunk(text);
+  });
+
+  await stream.finalMessage();
+  return fullText;
+}
+
+/**
  * Sonnet 호출 — 코드 수정용 (tool use 포함, 멀티턴 지원)
  * messages 배열을 직접 받아서 대화 이어가기 가능
  */
@@ -34,4 +57,4 @@ async function callSonnet(systemPrompt, messages, tools) {
   return response;
 }
 
-module.exports = { client, callHaiku, callSonnet };
+module.exports = { client, callHaiku, callHaikuStream, callSonnet };

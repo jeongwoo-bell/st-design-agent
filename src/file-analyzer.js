@@ -103,4 +103,56 @@ function readFiles(filePaths, repoPath) {
   return results;
 }
 
-module.exports = { collectFileTree, identifyRelevantFiles, readFiles };
+/**
+ * 파일 선정 검증 — 요청에서 키워드를 추출하고, 선정된 파일에 해당 키워드 관련 파일이 포함됐는지 확인.
+ * 누락 시 파일 트리에서 매칭되는 파일을 자동 추가.
+ */
+function validateFileSelection(request, selectedFiles, fileTree) {
+  // UI 컴포넌트 키워드 매핑 (한/영)
+  const KEYWORD_MAP = [
+    { keywords: ["헤더", "header", "네비", "nav", "gnb"], pattern: /header|nav|gnb/i },
+    { keywords: ["푸터", "footer"], pattern: /footer/i },
+    { keywords: ["사이드바", "sidebar", "drawer"], pattern: /sidebar|drawer/i },
+    { keywords: ["모달", "modal", "dialog", "팝업", "popup"], pattern: /modal|dialog|popup/i },
+    { keywords: ["버튼", "button", "btn", "cta"], pattern: /button|btn|cta/i },
+    { keywords: ["폼", "form", "입력", "input"], pattern: /form|input/i },
+    { keywords: ["카드", "card"], pattern: /card/i },
+    { keywords: ["탭", "tab"], pattern: /tab/i },
+    { keywords: ["레이아웃", "layout"], pattern: /layout/i },
+    { keywords: ["페이지", "page"], pattern: /page\.(tsx|ts|jsx|js)$/i },
+  ];
+
+  const requestLower = request.toLowerCase();
+  const added = [];
+
+  for (const { keywords, pattern } of KEYWORD_MAP) {
+    // 요청에 키워드가 포함되어 있는지
+    const mentioned = keywords.some((kw) => requestLower.includes(kw));
+    if (!mentioned) continue;
+
+    // 이미 선정된 파일에 해당 패턴이 있는지
+    const alreadyIncluded = selectedFiles.some((f) => pattern.test(f));
+    if (alreadyIncluded) continue;
+
+    // 파일 트리에서 매칭되는 파일 찾기
+    const candidates = fileTree.filter((f) => pattern.test(f));
+    if (candidates.length > 0) {
+      // 가장 관련성 높은 파일 추가 (index.tsx 우선, 최대 3개)
+      const sorted = candidates.sort((a, b) => {
+        const aIdx = a.includes("index.") ? -1 : 0;
+        const bIdx = b.includes("index.") ? -1 : 0;
+        return aIdx - bIdx;
+      });
+      const toAdd = sorted.slice(0, 3);
+      added.push(...toAdd);
+      console.log(`[FILE-ANALYZER] 검증: "${keywords[0]}" 관련 파일 자동 추가 → ${toAdd.join(", ")}`);
+    }
+  }
+
+  if (added.length > 0) {
+    return [...new Set([...selectedFiles, ...added])];
+  }
+  return selectedFiles;
+}
+
+module.exports = { collectFileTree, identifyRelevantFiles, readFiles, validateFileSelection };
