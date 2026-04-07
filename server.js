@@ -101,38 +101,38 @@ app.get("/api/me", authMiddleware, (req, res) => {
   res.json({ user: req.user });
 });
 
-app.put("/api/me/profile", authMiddleware, (req, res) => {
+app.put("/api/me/profile", authMiddleware, async (req, res) => {
   const { name, picture } = req.body;
   const { updateUserProfile } = require("./src/database");
-  updateUserProfile(req.user.id, { name, picture });
+  await updateUserProfile(req.user.id, { name, picture });
   console.log(`\x1b[34m[USER]\x1b[0m 프로필 업데이트: ${req.user.email} → name=${name ? '변경' : '유지'}, picture=${picture ? '변경' : '유지'}`);
   res.json({ ok: true });
 });
 
-app.put("/api/me/settings", authMiddleware, (req, res) => {
+app.put("/api/me/settings", authMiddleware, async (req, res) => {
   const { settings } = req.body;
   if (!settings) return res.status(400).json({ error: "settings is required" });
-  updateUserSettings(req.user.id, settings);
+  await updateUserSettings(req.user.id, settings);
   console.log(`\x1b[34m[USER]\x1b[0m 설정 업데이트: ${req.user.email} → ${JSON.stringify(settings)}`);
   res.json({ ok: true });
 });
 
-app.get("/api/conversations", authMiddleware, (req, res) => {
-  const conversations = listConversations(req.user.id);
+app.get("/api/conversations", authMiddleware, async (req, res) => {
+  const conversations = await listConversations(req.user.id);
   console.log(`\x1b[90m[CONV]\x1b[0m 목록 조회: ${req.user.email} → ${conversations.length}개`);
   res.json({ conversations });
 });
 
-app.get("/api/conversations/:id/messages", authMiddleware, (req, res) => {
-  const messages = getConversationMessages(req.params.id);
+app.get("/api/conversations/:id/messages", authMiddleware, async (req, res) => {
+  const messages = await getConversationMessages(req.params.id);
   console.log(`\x1b[90m[CONV]\x1b[0m 메시지 조회: ${req.params.id.slice(0, 8)} → ${messages.length}개`);
   res.json({ messages });
 });
 
 /** 대화 처리 상태 조회 — DB에서 직접 읽음 */
-app.get("/api/conversations/:id/status", authMiddleware, (req, res) => {
+app.get("/api/conversations/:id/status", authMiddleware, async (req, res) => {
   const { getProcessingStatus } = require("./src/database");
-  const status = getProcessingStatus(req.params.id);
+  const status = await getProcessingStatus(req.params.id);
   if (!status) {
     res.json({ processing: false });
   } else {
@@ -140,9 +140,9 @@ app.get("/api/conversations/:id/status", authMiddleware, (req, res) => {
   }
 });
 
-app.delete("/api/conversations/:id", authMiddleware, (req, res) => {
+app.delete("/api/conversations/:id", authMiddleware, async (req, res) => {
   const { deleteConversation } = require("./src/database");
-  deleteConversation(req.params.id, req.user.id);
+  await deleteConversation(req.params.id, req.user.id);
   console.log(`\x1b[31m[CONV]\x1b[0m 대화 삭제: ${req.params.id.slice(0, 8)} by ${req.user.email}`);
   res.json({ ok: true });
 });
@@ -158,6 +158,51 @@ app.post("/api/pr", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(`\x1b[31m[PR]\x1b[0m 생성 실패:`, err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// 피드백/리포트 이메일 발송
+// ============================================
+app.post("/api/report", authMiddleware, async (req, res) => {
+  const { title, content } = req.body;
+  if (!title || !content) return res.status(400).json({ error: "title and content are required" });
+
+  const from = req.user.email;
+  console.log(`\x1b[35m[REPORT]\x1b[0m 피드백 접수: "${title}" from ${from}`);
+
+  try {
+    const nodemailer = require("nodemailer");
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD,
+      },
+    });
+
+    await transporter.sendMail({
+      from: `"Sleep Agent 피드백" <${process.env.GMAIL_USER}>`,
+      to: "jeongwoo.lee@belltherapeutics.com",
+      replyTo: from,
+      subject: `[Sleep Agent 피드백] ${title}`,
+      text: `보낸 사람: ${req.user.name} (${from})\n\n${content}`,
+      html: `
+        <div style="font-family: sans-serif; max-width: 600px;">
+          <h2 style="color: #4F46E5;">[Sleep Agent 피드백]</h2>
+          <p><strong>제목:</strong> ${title}</p>
+          <p><strong>보낸 사람:</strong> ${req.user.name} (${from})</p>
+          <hr style="border: 1px solid #eee;" />
+          <div style="white-space: pre-wrap;">${content}</div>
+        </div>
+      `,
+    });
+
+    console.log(`\x1b[32m[REPORT]\x1b[0m 이메일 발송 완료 → jeongwoo.lee@belltherapeutics.com`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`\x1b[31m[REPORT]\x1b[0m 이메일 발송 실패:`, err.message);
+    res.status(500).json({ error: "이메일 발송에 실패했어요. 다시 시도해주세요." });
   }
 });
 

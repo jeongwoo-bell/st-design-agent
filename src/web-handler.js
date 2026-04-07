@@ -37,7 +37,7 @@ async function handleRequest(params, emit) {
     return await _handleRequestInner(params, emit, (id) => { _convId = id; });
   } finally {
     // 어떤 경로든 처리 완료 시 processing 해제
-    if (_convId) updateProcessingStatus(_convId, null);
+    if (_convId) await updateProcessingStatus(_convId, null);
   }
 }
 
@@ -46,10 +46,10 @@ async function _handleRequestInner({ message, threadId, figmaUrl, userName, chat
   message = message || "";
 
   // DB: 대화 찾기/생성 + 유저 메시지 저장
-  const conversation = findOrCreateConversation(userId, threadId);
+  const conversation = await findOrCreateConversation(userId, threadId);
 
   // 대화 히스토리 — DB에서 직접 읽어서 메타데이터(브랜치, 파일 등)까지 포함
-  const dbMessages = getConversationMessages(conversation.id);
+  const dbMessages = await getConversationMessages(conversation.id);
   let threadHistory = null;
   if (dbMessages.length > 0) {
     threadHistory = dbMessages.map((m) => {
@@ -65,7 +65,7 @@ async function _handleRequestInner({ message, threadId, figmaUrl, userName, chat
     }).join("\n\n");
   }
   setConvId(conversation.id);
-  saveMessage({ conversationId: conversation.id, role: "user", content: message || "", type: null, metadata: { figmaUrl, userName, hasImages: !!(images && images.length > 0), imageCount: images?.length || 0 } });
+  await saveMessage({ conversationId: conversation.id, role: "user", content: message || "", type: null, metadata: { figmaUrl, userName, hasImages: !!(images && images.length > 0), imageCount: images?.length || 0 } });
 
   // 처리 상태 추적 — DB에 저장해서 새로고침 후에도 복원 가능
   const processingSteps = [];
@@ -76,11 +76,11 @@ async function _handleRequestInner({ message, threadId, figmaUrl, userName, chat
       const existing = processingSteps.find((s) => s.step === data.step);
       if (existing) Object.assign(existing, data);
       else processingSteps.push({ ...data });
-      updateProcessingStatus(conversation.id, { processing: true, steps: processingSteps });
+      updateProcessingStatus(conversation.id, { processing: true, steps: processingSteps }).catch(() => {});
     }
   };
   // 시작 표시
-  updateProcessingStatus(conversation.id, { processing: true, steps: [] });
+  await updateProcessingStatus(conversation.id, { processing: true, steps: [] });
 
   // 이미지 캐시 — 새 이미지가 오면 저장, 없으면 이전 이미지 사용
   if (images && images.length > 0) {
@@ -112,15 +112,15 @@ async function _handleRequestInner({ message, threadId, figmaUrl, userName, chat
 
   if (category === "talk") {
     const result = await _handleTalk(message, userName, threadHistory, emit, effectiveImages);
-    saveMessage({ conversationId: conversation.id, role: "assistant", content: result.message, type: "talk" });
-    if (!conversation.title) updateConversation(conversation.id, { title: message.slice(0, 100) });
+    await saveMessage({ conversationId: conversation.id, role: "assistant", content: result.message, type: "talk" });
+    if (!conversation.title) await updateConversation(conversation.id, { title: message.slice(0, 100) });
     return { ...result, threadId: conversation.thread_id };
   }
 
   if (category === "ask") {
     const result = await _handleAsk(message, userName, threadHistory, threadId, emit, effectiveImages);
-    saveMessage({ conversationId: conversation.id, role: "assistant", content: result.message, type: "ask" });
-    if (!conversation.title) updateConversation(conversation.id, { title: message.slice(0, 100) });
+    await saveMessage({ conversationId: conversation.id, role: "assistant", content: result.message, type: "ask" });
+    if (!conversation.title) await updateConversation(conversation.id, { title: message.slice(0, 100) });
     return { ...result, threadId: conversation.thread_id };
   }
 
@@ -128,7 +128,7 @@ async function _handleRequestInner({ message, threadId, figmaUrl, userName, chat
     const msg = hasImages
       ? "이미지를 확인했어요! 어떻게 도와드릴까요?\n\n예시:\n• \"이 디자인대로 구현해줘\"\n• \"이 부분의 색상을 바꿔줘\"\n• \"이 레이아웃을 참고해서 수정해줘\""
       : "요청을 이해하지 못했어요. 좀 더 구체적으로 말씀해주세요.";
-    saveMessage({ conversationId: conversation.id, role: "assistant", content: msg, type: "unclear" });
+    await saveMessage({ conversationId: conversation.id, role: "assistant", content: msg, type: "unclear" });
     return { type: "unclear", message: msg, threadId: conversation.thread_id };
   }
 
@@ -148,7 +148,7 @@ async function _handleRequestInner({ message, threadId, figmaUrl, userName, chat
     // 실패해도 작업은 계속 진행
   }
 
-  if (!conversation.title) updateConversation(conversation.id, { title: message.slice(0, 100) });
+  if (!conversation.title) await updateConversation(conversation.id, { title: message.slice(0, 100) });
 
   const queuePosition = getQueueLength();
   if (queuePosition > 0) {
@@ -169,7 +169,7 @@ async function _handleRequestInner({ message, threadId, figmaUrl, userName, chat
         });
         resolve(result);
       } catch (err) {
-        saveMessage({ conversationId: conversation.id, role: "assistant", content: err.message, type: "error" });
+        await saveMessage({ conversationId: conversation.id, role: "assistant", content: err.message, type: "error" });
         reject(err);
       }
     });
@@ -307,7 +307,7 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
             specIds: docsResult.specIds,
             implemented: docsResult.implStatus.implemented,
           };
-          saveMessage({ conversationId, role: "assistant", content: `이미 구현됨: ${docsResult.implStatus.implemented?.join(", ")}`, type: "already_implemented", metadata: implResult });
+          await saveMessage({ conversationId, role: "assistant", content: `이미 구현됨: ${docsResult.implStatus.implemented?.join(", ")}`, type: "already_implemented", metadata: implResult });
           return implResult;
         }
         emit("progress", { step: "docs", state: "done", status: docsResult?.implStatus?.status || "none" });
@@ -341,7 +341,7 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
 
   if (appliedChanges.length === 0) {
     await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-    saveMessage({ conversationId, role: "assistant", content: "수정할 내용을 찾지 못했어요.", type: "no_changes" });
+    await saveMessage({ conversationId, role: "assistant", content: "수정할 내용을 찾지 못했어요.", type: "no_changes" });
     return { type: "no_changes", message: "수정할 내용을 찾지 못했어요." };
   }
 
@@ -383,7 +383,7 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
       errorSummary = "빌드에 실패했어요. 코드에 오류가 있어 수정이 필요해요.";
     }
 
-    saveMessage({ conversationId, role: "assistant", content: errorSummary, type: "build_failed", metadata: { rawError: buildResult.stderr.slice(0, 500) } });
+    await saveMessage({ conversationId, role: "assistant", content: errorSummary, type: "build_failed", metadata: { rawError: buildResult.stderr.slice(0, 500) } });
     return { type: "build_failed", errorSummary, error: buildResult.stderr.slice(0, 500) };
   }
   emit("progress", { step: "build", state: "done" });
@@ -441,7 +441,7 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
     console.warn("[GIT] 변경사항 없음 — 커밋 스킵");
     emit("progress", { step: "push", state: "done" });
     await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-    saveMessage({ conversationId, role: "assistant", content: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", type: "no_changes" });
+    await saveMessage({ conversationId, role: "assistant", content: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", type: "no_changes" });
     return { type: "no_changes", message: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", threadId };
   }
 
@@ -491,8 +491,8 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
 
   // DB: 성공 결과 저장 + 대화 메타데이터 업데이트
   const resultData = { type: "success", summary, branchName, previewUrl, changedFiles, threadId };
-  saveMessage({ conversationId, role: "assistant", content: summary, type: "success", metadata: { branchName, previewUrl, changedFiles } });
-  updateConversation(conversationId, { branch_name: branchName });
+  await saveMessage({ conversationId, role: "assistant", content: summary, type: "success", metadata: { branchName, previewUrl, changedFiles } });
+  await updateConversation(conversationId, { branch_name: branchName });
 
   return resultData;
 }

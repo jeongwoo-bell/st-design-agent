@@ -42,7 +42,7 @@ async function authMiddleware(req, res, next) {
     }
 
     // DB에 유저 생성/업데이트
-    const user = findOrCreateUser(payload.email, payload.name, payload.picture);
+    const user = await findOrCreateUser(payload.email, payload.name, payload.picture);
     req.user = user;
     next();
   } catch (err) {

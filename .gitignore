@@ -7,4 +7,6 @@ yarn-error.log*
 dist/
 build/
 .cursor/
-clawjeongwoo.pemdata/
+*.pem
+data/
+.claude/worktrees/

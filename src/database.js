@@ -1,39 +1,36 @@
 // ============================================
-// SQLite 데이터베이스 초기화 + 채팅 저장 모듈
-// DB 교체 시 이 파일 내부만 변경하면 됨 (인터페이스 유지)
+// PostgreSQL 데이터베이스 모듈
+// 인터페이스(함수명, 반환값)는 기존 SQLite와 동일 유지
+// 모든 함수는 async — 호출 시 await 필요
 // ============================================
-const Database = require("better-sqlite3");
-const path = require("path");
+const { Pool } = require("pg");
 const crypto = require("crypto");
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data", "chat.db");
+let pool;
 
-let db;
-
-function getDb() {
-  if (!db) {
-    const fs = require("fs");
-    const dir = path.dirname(DB_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-    db = new Database(DB_PATH);
-    db.pragma("journal_mode = WAL");
-    db.pragma("foreign_keys = ON");
-    initTables();
+function getPool() {
+  if (!pool) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DB_SSL === "false" ? false : { rejectUnauthorized: false },
+      max: 10,
+    });
+    pool.on("error", (err) => console.error("[DB] Pool 에러:", err.message));
   }
-  return db;
+  return pool;
 }
 
-function initTables() {
-  db.exec(`
+async function initTables() {
+  const p = getPool();
+  await p.query(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       email TEXT UNIQUE NOT NULL,
       name TEXT,
       picture TEXT,
-      settings TEXT DEFAULT '{}',
-      created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now'))
+      settings JSONB DEFAULT '{}',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS conversations (
@@ -42,9 +39,9 @@ function initTables() {
       thread_id TEXT UNIQUE,
       branch_name TEXT,
       title TEXT,
-      processing_status TEXT DEFAULT NULL,
-      created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now'))
+      processing_status JSONB DEFAULT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
@@ -55,180 +52,189 @@ function initTables() {
       role TEXT NOT NULL,
       content TEXT NOT NULL,
       type TEXT,
-      metadata TEXT DEFAULT '{}',
-      created_at TEXT DEFAULT (datetime('now'))
+      metadata JSONB DEFAULT '{}',
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
   `);
-
-  // 마이그레이션: processing_status 컬럼 추가 (기존 DB 호환)
-  try {
-    db.exec("ALTER TABLE conversations ADD COLUMN processing_status TEXT DEFAULT NULL");
-  } catch {}
+  console.log("[DB] PostgreSQL 테이블 초기화 완료");
 }
+
+// 서버 시작 시 호출
+initTables().catch((err) => console.error("[DB] 테이블 초기화 실패:", err.message));
 
 // ============================================
 // Users
 // ============================================
 
-function findOrCreateUser(email, name, picture) {
-  const d = getDb();
+async function findOrCreateUser(email, name, picture) {
+  const p = getPool();
 
-  const existing = d.prepare("SELECT * FROM users WHERE email = ?").get(email);
-  if (existing) {
-    // 기존 유저 — 커스텀 프로필이 있으면 유지, 없으면 Google 정보로 채움
-    const updatedName = existing.name || name;
-    const updatedPicture = existing.picture || picture;
-    return { ...existing, name: updatedName, picture: updatedPicture, settings: JSON.parse(existing.settings || "{}") };
+  const { rows } = await p.query("SELECT * FROM users WHERE email = $1", [email]);
+  if (rows.length > 0) {
+    const existing = rows[0];
+    return { ...existing, name: existing.name || name, picture: existing.picture || picture, settings: existing.settings || {} };
   }
 
   const id = crypto.randomUUID();
-  d.prepare("INSERT INTO users (id, email, name, picture) VALUES (?, ?, ?, ?)")
-    .run(id, email, name || null, picture || null);
+  await p.query(
+    "INSERT INTO users (id, email, name, picture) VALUES ($1, $2, $3, $4)",
+    [id, email, name || null, picture || null],
+  );
 
-  const newUser = d.prepare("SELECT * FROM users WHERE id = ?").get(id);
-  return { ...newUser, settings: JSON.parse(newUser.settings || "{}") };
+  const { rows: newRows } = await p.query("SELECT * FROM users WHERE id = $1", [id]);
+  return { ...newRows[0], settings: newRows[0].settings || {} };
 }
 
-function getUser(id) {
-  const d = getDb();
-  const user = d.prepare("SELECT * FROM users WHERE id = ?").get(id);
-  if (user) user.settings = JSON.parse(user.settings || "{}");
-  return user;
+async function getUser(id) {
+  const p = getPool();
+  const { rows } = await p.query("SELECT * FROM users WHERE id = $1", [id]);
+  if (rows.length === 0) return null;
+  return { ...rows[0], settings: rows[0].settings || {} };
 }
 
-function getUserByEmail(email) {
-  const d = getDb();
-  const user = d.prepare("SELECT * FROM users WHERE email = ?").get(email);
-  if (user) user.settings = JSON.parse(user.settings || "{}");
-  return user;
+async function getUserByEmail(email) {
+  const p = getPool();
+  const { rows } = await p.query("SELECT * FROM users WHERE email = $1", [email]);
+  if (rows.length === 0) return null;
+  return { ...rows[0], settings: rows[0].settings || {} };
 }
 
-function updateUserSettings(userId, settings) {
-  const d = getDb();
-  d.prepare("UPDATE users SET settings = ?, updated_at = datetime('now') WHERE id = ?")
-    .run(JSON.stringify(settings), userId);
+async function updateUserSettings(userId, settings) {
+  const p = getPool();
+  await p.query(
+    "UPDATE users SET settings = $1, updated_at = NOW() WHERE id = $2",
+    [JSON.stringify(settings), userId],
+  );
 }
 
-function updateUserProfile(userId, { name, picture }) {
-  const d = getDb();
+async function updateUserProfile(userId, { name, picture }) {
+  const p = getPool();
   const fields = [];
   const values = [];
-  if (name !== undefined) { fields.push("name = ?"); values.push(name); }
-  if (picture !== undefined) { fields.push("picture = ?"); values.push(picture); }
+  let idx = 1;
+  if (name !== undefined) { fields.push(`name = $${idx++}`); values.push(name); }
+  if (picture !== undefined) { fields.push(`picture = $${idx++}`); values.push(picture); }
   if (fields.length === 0) return;
-  fields.push("updated_at = datetime('now')");
+  fields.push("updated_at = NOW()");
   values.push(userId);
-  d.prepare(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+  await p.query(`UPDATE users SET ${fields.join(", ")} WHERE id = $${idx}`, values);
 }
 
 // ============================================
 // Conversations
 // ============================================
 
-function findOrCreateConversation(userId, threadId) {
-  const d = getDb();
+async function findOrCreateConversation(userId, threadId) {
+  const p = getPool();
 
   if (threadId) {
-    const existing = d.prepare("SELECT * FROM conversations WHERE thread_id = ?").get(threadId);
-    if (existing) return existing;
+    const { rows } = await p.query("SELECT * FROM conversations WHERE thread_id = $1", [threadId]);
+    if (rows.length > 0) return rows[0];
   }
 
   const id = crypto.randomUUID();
   const newThreadId = threadId || crypto.randomUUID();
 
-  d.prepare("INSERT INTO conversations (id, user_id, thread_id) VALUES (?, ?, ?)")
-    .run(id, userId, newThreadId);
+  await p.query(
+    "INSERT INTO conversations (id, user_id, thread_id) VALUES ($1, $2, $3)",
+    [id, userId, newThreadId],
+  );
 
-  return d.prepare("SELECT * FROM conversations WHERE id = ?").get(id);
+  const { rows } = await p.query("SELECT * FROM conversations WHERE id = $1", [id]);
+  return rows[0];
 }
 
-function updateConversation(id, updates) {
-  const d = getDb();
+async function updateConversation(id, updates) {
+  const p = getPool();
   const fields = [];
   const values = [];
+  let idx = 1;
 
   for (const [key, value] of Object.entries(updates)) {
     if (["branch_name", "title", "thread_id"].includes(key) && value !== undefined) {
-      fields.push(`${key} = ?`);
+      fields.push(`${key} = $${idx++}`);
       values.push(value);
     }
   }
 
   if (fields.length === 0) return;
 
-  fields.push("updated_at = datetime('now')");
+  fields.push("updated_at = NOW()");
   values.push(id);
-
-  d.prepare(`UPDATE conversations SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+  await p.query(`UPDATE conversations SET ${fields.join(", ")} WHERE id = $${idx}`, values);
 }
 
-function listConversations(userId, limit = 20) {
-  const d = getDb();
-  return d.prepare(
-    "SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
-  ).all(userId, limit);
+async function listConversations(userId, limit = 20) {
+  const p = getPool();
+  const { rows } = await p.query(
+    "SELECT * FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2",
+    [userId, limit],
+  );
+  return rows;
 }
 
-function getConversation(id) {
-  const d = getDb();
-  return d.prepare("SELECT * FROM conversations WHERE id = ?").get(id);
+async function getConversation(id) {
+  const p = getPool();
+  const { rows } = await p.query("SELECT * FROM conversations WHERE id = $1", [id]);
+  return rows[0] || null;
 }
 
-/**
- * 처리 상태 업데이트 — progress 단계마다 호출
- * @param {string} id - conversationId
- * @param {object} status - { processing: bool, steps: [], error?: string }
- */
-function updateProcessingStatus(id, status) {
-  const d = getDb();
-  d.prepare("UPDATE conversations SET processing_status = ? WHERE id = ?")
-    .run(JSON.stringify(status), id);
+async function updateProcessingStatus(id, status) {
+  const p = getPool();
+  await p.query(
+    "UPDATE conversations SET processing_status = $1 WHERE id = $2",
+    [status ? JSON.stringify(status) : null, id],
+  );
 }
 
-function getProcessingStatus(id) {
-  const d = getDb();
-  const row = d.prepare("SELECT processing_status FROM conversations WHERE id = ?").get(id);
-  if (!row?.processing_status) return null;
-  try { return JSON.parse(row.processing_status); } catch { return null; }
+async function getProcessingStatus(id) {
+  const p = getPool();
+  const { rows } = await p.query("SELECT processing_status FROM conversations WHERE id = $1", [id]);
+  if (!rows[0]?.processing_status) return null;
+  return typeof rows[0].processing_status === "string"
+    ? JSON.parse(rows[0].processing_status)
+    : rows[0].processing_status;
 }
 
-function deleteConversation(id, userId) {
-  const d = getDb();
-  // messages는 ON DELETE CASCADE로 자동 삭제
-  d.prepare("DELETE FROM conversations WHERE id = ? AND user_id = ?").run(id, userId);
+async function deleteConversation(id, userId) {
+  const p = getPool();
+  await p.query("DELETE FROM conversations WHERE id = $1 AND user_id = $2", [id, userId]);
 }
 
 // ============================================
 // Messages
 // ============================================
 
-function saveMessage({ conversationId, role, content, type, metadata }) {
-  const d = getDb();
+async function saveMessage({ conversationId, role, content, type, metadata }) {
+  const p = getPool();
   const id = crypto.randomUUID();
 
-  d.prepare(
-    "INSERT INTO messages (id, conversation_id, role, content, type, metadata) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(id, conversationId, role, content, type || null, JSON.stringify(metadata || {}));
+  await p.query(
+    "INSERT INTO messages (id, conversation_id, role, content, type, metadata) VALUES ($1, $2, $3, $4, $5, $6)",
+    [id, conversationId, role, content, type || null, JSON.stringify(metadata || {})],
+  );
 
   return id;
 }
 
-function getConversationMessages(conversationId, limit = 500) {
-  const d = getDb();
-  const rows = d.prepare(
-    "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT ?",
-  ).all(conversationId, limit);
+async function getConversationMessages(conversationId, limit = 500) {
+  const p = getPool();
+  const { rows } = await p.query(
+    "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT $2",
+    [conversationId, limit],
+  );
 
   return rows.map((row) => ({
     ...row,
-    metadata: JSON.parse(row.metadata || "{}"),
+    metadata: typeof row.metadata === "string" ? JSON.parse(row.metadata) : (row.metadata || {}),
   }));
 }
 
 module.exports = {
-  getDb,
+  getPool,
+  initTables,
   findOrCreateUser,
   getUser,
   getUserByEmail,
