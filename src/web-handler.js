@@ -20,6 +20,73 @@ const { findOrCreateConversation, saveMessage, updateConversation, updateProcess
 // 대화별 이미지 캐시 — 같은 대화에서 후속 메시지가 이전 이미지를 참조할 수 있도록
 const conversationImageCache = new Map(); // conversationId → images[]
 
+// AI 재시도 루프 안전장치: 최대 반복 횟수
+const MAX_LOOP = 10;
+
+// ============================================
+// 작업 플래닝 — Haiku가 실행 계획 + 안내 메시지 생성
+// ============================================
+const PLAN_SYSTEM = `너는 코드 수정 에이전트의 작업 플래너야.
+사용자의 요청과 주어진 조건을 분석해서, 어떤 단계를 어떤 순서로 실행할지 계획을 세워.
+
+## 사용 가능한 단계
+- analyze_image: 사용자가 보낸 이미지/스크린샷을 분석해서 디자인 의도 파악
+- fetch_figma: 피그마 URL에서 디자인 스펙 데이터 가져오기
+- analyze_files: 프로젝트 파일 구조를 분석해서 수정할 파일 찾기
+- check_docs: 스펙 문서 레포에서 관련 기획 내용 확인
+- generate_code: AI가 코드 수정안을 생성하고 적용
+- build: 빌드(컴파일) 검증 — 실패 시 AI가 자동 수정 후 재시도
+- verify: AI가 수정 결과를 검증 — 누락된 부분 있으면 보완
+- push: git 커밋 & 푸시
+- deploy: Vercel 프리뷰 배포 대기
+
+## 규칙
+- hasImages가 false면 analyze_image를 절대 넣지 마
+- hasFigma가 false면 fetch_figma를 절대 넣지 마
+- hasDocs가 false면 check_docs를 절대 넣지 마
+- analyze_files, generate_code, build, verify, push, deploy는 항상 포함
+- 순서: analyze_image/fetch_figma → analyze_files → check_docs → generate_code → build → verify → push → deploy
+- message에 유저한테 보여줄 자연스러운 안내를 1~2문장으로 작성해. 뭘 할 건지 미리 알려주는 톤.
+  - 이미지가 있으면 이미지 분석한다고 언급해
+  - 피그마가 있으면 디자인 스펙 참고한다고 언급해
+  - 후속 요청(isFollowUp)이면 이전 작업에 이어서 한다고 언급해
+
+## 응답 형식 (JSON만 출력)
+{
+  "steps": ["analyze_files", "generate_code", "build", "verify", "push", "deploy"],
+  "message": "코드를 분석해서 수정하고, 빌드 검증 후 프리뷰를 보여드릴게요!"
+}`;
+
+async function _planSteps({ message, hasImages, hasFigma, hasDocs, isFollowUp }) {
+  try {
+    const input = JSON.stringify({ message: message.slice(0, 300), hasImages, hasFigma, hasDocs, isFollowUp });
+    const raw = await callHaiku(PLAN_SYSTEM, input);
+    const plan = JSON.parse(raw.match(/\{[\s\S]*\}/)[0]);
+
+    // 안전장치: 필수 단계 누락 방지
+    const required = ["analyze_files", "generate_code", "build", "verify", "push", "deploy"];
+    for (const step of required) {
+      if (!plan.steps.includes(step)) plan.steps.push(step);
+    }
+    // 조건부 단계가 잘못 들어간 경우 제거
+    if (!hasImages) plan.steps = plan.steps.filter((s) => s !== "analyze_image");
+    if (!hasFigma) plan.steps = plan.steps.filter((s) => s !== "fetch_figma");
+    if (!hasDocs) plan.steps = plan.steps.filter((s) => s !== "check_docs");
+
+    return plan;
+  } catch (err) {
+    console.warn("[PLAN] 플래닝 실패, 기본 계획 사용:", err.message);
+    // 폴백: 기본 계획
+    const steps = [];
+    if (hasImages) steps.push("analyze_image");
+    if (hasFigma) steps.push("fetch_figma");
+    steps.push("analyze_files");
+    if (hasDocs) steps.push("check_docs");
+    steps.push("generate_code", "build", "verify", "push", "deploy");
+    return { steps, message: "코드를 수정하고 프리뷰를 준비할게요!" };
+  }
+}
+
 /**
  * 메시지 처리 — 분류 후 분기
  * @param {object} params
@@ -132,21 +199,8 @@ async function _handleRequestInner({ message, threadId, figmaUrl, userName, chat
     return { type: "unclear", message: msg, threadId: conversation.thread_id };
   }
 
-  // code 요청 — 이해 확인 메시지 생성
+  // code 요청 — plan 메시지는 _processCodeRequest 안에서 emit
   const fullMessage = figmaUrl ? `${message}\n\n피그마: ${figmaUrl}` : message;
-
-  try {
-    const ack = await callHaikuStream(
-      `너는 UI 수정 에이전트야. 사용자의 요청을 읽고, 이해한 내용을 1~2문장으로 자연스럽게 확인해줘.
-"네, ~하겠습니다" 형태로 시작해. 요청에 포함된 핵심 변경사항을 간결히 언급해.
-구체적 구현 방법은 말하지 마. 예시: "네, 버튼 호버 시 물결 효과를 추가하고 트랜지션을 부드럽게 적용하겠습니다."`,
-      message,
-      (chunk) => emit("stream", { delta: chunk }),
-    );
-    emit("stream_end", { content: ack });
-  } catch {
-    // 실패해도 작업은 계속 진행
-  }
 
   if (!conversation.title) await updateConversation(conversation.id, { title: message.slice(0, 100) });
 
@@ -234,280 +288,288 @@ async function _handleAsk(message, userName, threadHistory, threadId, emit, imag
 }
 
 /**
- * 코드 수정 파이프라인 — 슬랙 의존성 제거, emit으로 진행상황 전달
+ * 코드 수정 파이프라인 — Haiku 플래닝 → stepHandlers 순차 실행
  */
 async function _processCodeRequest({ message, threadId, userName, threadHistory, emit, conversationId, images }) {
   const existing = threadBranchMap.get(threadId);
   const isFollowUp = !!existing;
-  let branchName;
   const repoPath = CONFIG.repo.path;
+  const hasFigma = containsFigmaLink(message);
 
-  // 1. 브랜치 준비
-  emit("progress", { step: "branch", state: "start" });
+  // 공유 컨텍스트 — stepHandlers 간 데이터 전달용
+  const ctx = {
+    message, threadId, userName, threadHistory, emit, conversationId, images,
+    repoPath, isFollowUp, existing,
+    branchName: null,
+    figmaData: null,
+    fileContents: [],
+    relevantPaths: [],
+    docsResult: null,
+    appliedChanges: [],
+    context: null, // 코드 생성에 넘길 context
+    pushTimestamp: null,
+  };
+
+  // ── 0. 브랜치 준비 (항상 실행, 플랜 밖) ──
   await ensureRepo();
-
   if (isFollowUp) {
-    branchName = existing.branchName;
+    ctx.branchName = existing.branchName;
     try {
-      await switchToBranch(branchName);
+      await switchToBranch(ctx.branchName);
     } catch {
-      branchName = await createBranchName(message);
-      await switchToBranch(branchName, true);
-      threadBranchMap.set(threadId, { branchName, hasCommit: false, changes: [] });
+      ctx.branchName = await createBranchName(message);
+      await switchToBranch(ctx.branchName, true);
+      threadBranchMap.set(threadId, { branchName: ctx.branchName, hasCommit: false, changes: [] });
       saveThreadMap(threadBranchMap);
     }
   } else {
-    branchName = await createBranchName(message);
-    await switchToBranch(branchName, true);
-    threadBranchMap.set(threadId, { branchName, hasCommit: false, changes: [] });
+    ctx.branchName = await createBranchName(message);
+    await switchToBranch(ctx.branchName, true);
+    threadBranchMap.set(threadId, { branchName: ctx.branchName, hasCommit: false, changes: [] });
     saveThreadMap(threadBranchMap);
   }
-  emit("progress", { step: "branch", state: "done", branchName });
 
-  // 2. 피그마 데이터
-  let figmaData = null;
-  const hasFigma = containsFigmaLink(message);
-  if (hasFigma && CONFIG.figma.apiKey) {
-    emit("progress", { step: "figma", state: "start" });
-    try {
-      figmaData = await fetchFigmaData(message);
-      emit("progress", { step: "figma", state: "done", count: figmaData?.specs?.length || 0 });
-    } catch (err) {
-      emit("progress", { step: "figma", state: "error", error: err.message });
-    }
-  }
-
-  // 2-b. 이미지 분석
-  if (images && images.length > 0) {
-    emit("progress", { step: "image", state: "start", count: images.length });
-    emit("progress", { step: "image", state: "done", count: images.length });
-  }
-
-  // 3. 파일 분석 + 선정 검증
-  emit("progress", { step: "analyze", state: "start" });
-  const fileTree = collectFileTree(repoPath);
-  const initialPaths = await identifyRelevantFiles(message, fileTree, figmaData);
-  const relevantPaths = validateFileSelection(message, initialPaths, fileTree);
-  const fileContents = readFiles(relevantPaths, repoPath);
-  emit("progress", { step: "analyze", state: "done", fileCount: fileContents.length });
-
-  // 4. docs 스펙 분석
-  let docsResult = null;
-  if (CONFIG.docs.url) {
-    emit("progress", { step: "docs", state: "start" });
-    try {
-      const docsReady = await ensureDocsRepo();
-      if (docsReady) {
-        docsResult = await buildDocsContext(message, fileContents);
-        if (docsResult?.implStatus?.status === "implemented") {
-          emit("progress", { step: "docs", state: "done", status: "implemented" });
-          await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-          const implResult = {
-            type: "already_implemented",
-            specIds: docsResult.specIds,
-            implemented: docsResult.implStatus.implemented,
-          };
-          await saveMessage({ conversationId, role: "assistant", content: `이미 구현됨: ${docsResult.implStatus.implemented?.join(", ")}`, type: "already_implemented", metadata: implResult });
-          return implResult;
-        }
-        emit("progress", { step: "docs", state: "done", status: docsResult?.implStatus?.status || "none" });
-      }
-    } catch (err) {
-      emit("progress", { step: "docs", state: "error", error: err.message });
-    }
-  }
-
-  // 5. 코드 생성 (멀티턴 중 즉시 디스크 적용됨)
-  emit("progress", { step: "codegen", state: "start" });
-  const threadData = threadBranchMap.get(threadId);
-
-  // 코드베이스 컨텍스트 — tailwind config, 기존 컴포넌트 목록
-  let codebaseContext = "";
-  try {
-    const fs = require("fs");
-    const path = require("path");
-    // tailwind config
-    for (const configName of ["tailwind.config.ts", "tailwind.config.js"]) {
-      const configPath = path.join(repoPath, configName);
-      if (fs.existsSync(configPath)) {
-        const configContent = fs.readFileSync(configPath, "utf-8");
-        codebaseContext += `### ${configName} (커스텀 색상/토큰 참고)\n\`\`\`\n${configContent.slice(0, 3000)}\n\`\`\`\n\n`;
-        break;
-      }
-    }
-    // 기존 컴포넌트 목록
-    const componentsDir = path.join(repoPath, "src/components");
-    if (fs.existsSync(componentsDir)) {
-      const components = fs.readdirSync(componentsDir, { recursive: true })
-        .filter((f) => f.endsWith("index.tsx"))
-        .map((f) => `src/components/${f}`);
-      if (components.length > 0) {
-        codebaseContext += `### 기존 컴포넌트 (재사용 가능)\n${components.join("\n")}\n\n`;
-      }
-    }
-  } catch {}
-
-  const context = {
+  // ── 1. Haiku 플래닝 — 실행 계획 + 안내 메시지 ──
+  const plan = await _planSteps({
+    message,
+    hasImages: !!(images && images.length > 0),
+    hasFigma: hasFigma && !!CONFIG.figma.apiKey,
+    hasDocs: !!CONFIG.docs.url,
     isFollowUp,
-    isFirstCommit: !threadData.hasCommit,
-    previousChanges: isFollowUp ? threadData.changes.join("\n---\n") : null,
-    threadHistory,
-    docsContext: docsResult?.docsContext || null,
-    images,
-    codebaseContext: codebaseContext || null,
-  };
+  });
 
-  let codeResult;
-  try {
-    codeResult = await generateCodeChanges(message, fileContents, figmaData, context, repoPath);
-  } catch (err) {
-    await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-    throw new Error(`코드 생성 실패: ${err.message}`);
-  }
+  console.log(`[PLAN] 단계: ${plan.steps.join(" → ")}`);
+  console.log(`[PLAN] 메시지: ${plan.message}`);
 
-  let appliedChanges = codeResult.appliedChanges || [];
+  // 프론트에 계획 전달 — 동적 프로그레스바 구성용
+  emit("plan", { steps: plan.steps, message: plan.message, branchName: ctx.branchName });
 
-  if (appliedChanges.length === 0) {
-    await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-    await saveMessage({ conversationId, role: "assistant", content: "수정할 내용을 찾지 못했어요.", type: "no_changes" });
-    return { type: "no_changes", message: "수정할 내용을 찾지 못했어요." };
-  }
+  // AI 안내 메시지를 유저에게 스트리밍
+  emit("stream", { delta: plan.message });
+  emit("stream_end", { content: plan.message });
 
-  emit("progress", { step: "codegen", state: "done", fileCount: [...new Set(appliedChanges.map((c) => c.filePath))].length });
+  // ── 2. stepHandlers — 각 단계의 실행 로직 ──
+  const stepHandlers = {
+    analyze_image: async () => {
+      // 이미지는 ctx.images에 이미 있음 — 이후 generate_code에서 context.images로 전달
+      console.log(`[STEP:analyze_image] 이미지 ${ctx.images?.length || 0}장 분석 준비`);
+    },
 
-  // 6. 빌드 (검증보다 먼저)
-  // 8. 빌드
-  emit("progress", { step: "build", state: "start" });
-  let buildResult;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    buildResult = await runBuild(repoPath);
-    if (buildResult.success) break;
-
-    if (attempt < 3) {
-      const allPaths = [...new Set([...relevantPaths, ...appliedChanges.map((c) => c.filePath)])];
-      const currentFiles = readFiles(allPaths, repoPath);
+    fetch_figma: async () => {
       try {
-        const fixResult = await fixBuildError(buildResult.stderr, currentFiles, repoPath);
-        appliedChanges.push(...(fixResult.appliedChanges || []));
-      } catch {}
-    }
-  }
+        ctx.figmaData = await fetchFigmaData(message);
+        console.log(`[STEP:fetch_figma] 피그마 스펙 ${ctx.figmaData?.specs?.length || 0}건`);
+      } catch (err) {
+        console.warn(`[STEP:fetch_figma] 실패: ${err.message}`);
+      }
+    },
 
-  if (!buildResult.success) {
-    await revertChanges(repoPath);
-    await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-    emit("progress", { step: "build", state: "error" });
+    analyze_files: async () => {
+      const fileTree = collectFileTree(repoPath);
+      const initialPaths = await identifyRelevantFiles(message, fileTree, ctx.figmaData);
+      ctx.relevantPaths = validateFileSelection(message, initialPaths, fileTree);
+      ctx.fileContents = readFiles(ctx.relevantPaths, repoPath);
+      console.log(`[STEP:analyze_files] 관련 파일 ${ctx.fileContents.length}개`);
+    },
 
-    // 에러 요약 생성
-    let errorSummary;
-    try {
-      errorSummary = await callHaiku(
-        `너는 프론트엔드 빌드 에러 분석기야. 아래 빌드 에러를 비개발자도 이해할 수 있게 1~2문장으로 요약해.
+    check_docs: async () => {
+      try {
+        const docsReady = await ensureDocsRepo();
+        if (docsReady) {
+          ctx.docsResult = await buildDocsContext(message, ctx.fileContents);
+          if (ctx.docsResult?.implStatus?.status === "implemented") {
+            await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+            const implResult = {
+              type: "already_implemented",
+              specIds: ctx.docsResult.specIds,
+              implemented: ctx.docsResult.implStatus.implemented,
+            };
+            await saveMessage({ conversationId, role: "assistant", content: `이미 구현됨: ${ctx.docsResult.implStatus.implemented?.join(", ")}`, type: "already_implemented", metadata: implResult });
+            throw { __earlyReturn: implResult };
+          }
+        }
+      } catch (err) {
+        if (err.__earlyReturn) throw err;
+        console.warn(`[STEP:check_docs] 실패: ${err.message}`);
+      }
+    },
+
+    generate_code: async () => {
+      const threadData = threadBranchMap.get(threadId);
+      ctx.context = {
+        isFollowUp,
+        isFirstCommit: !threadData.hasCommit,
+        previousChanges: isFollowUp ? threadData.changes.join("\n---\n") : null,
+        threadHistory,
+        docsContext: ctx.docsResult?.docsContext || null,
+        images,
+      };
+
+      const codeResult = await generateCodeChanges(message, ctx.fileContents, ctx.figmaData, ctx.context, repoPath);
+      ctx.appliedChanges = codeResult.appliedChanges || [];
+
+      if (ctx.appliedChanges.length === 0) {
+        await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+        await saveMessage({ conversationId, role: "assistant", content: "수정할 내용을 찾지 못했어요.", type: "no_changes" });
+        throw { __earlyReturn: { type: "no_changes", message: "수정할 내용을 찾지 못했어요." } };
+      }
+    },
+
+    build: async () => {
+      let buildResult = { success: false };
+      let buildAttempt = 0;
+      while (!buildResult.success && buildAttempt < MAX_LOOP) {
+        buildAttempt++;
+        buildResult = await runBuild(repoPath);
+        if (buildResult.success) break;
+
+        console.log(`[STEP:build] 빌드 실패 (${buildAttempt}/${MAX_LOOP}), AI 수정 시도...`);
+        emit("progress", { step: "build", state: "retrying", attempt: buildAttempt, maxAttempt: MAX_LOOP });
+        const allPaths = [...new Set([...ctx.relevantPaths, ...ctx.appliedChanges.map((c) => c.filePath)])];
+        const currentFiles = readFiles(allPaths, repoPath);
+        try {
+          const fixResult = await fixBuildError(buildResult.stderr, currentFiles, repoPath);
+          ctx.appliedChanges.push(...(fixResult.appliedChanges || []));
+        } catch {}
+      }
+
+      if (!buildResult.success) {
+        await revertChanges(repoPath);
+        await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+
+        let errorSummary;
+        try {
+          errorSummary = await callHaiku(
+            `너는 프론트엔드 빌드 에러 분석기야. 아래 빌드 에러를 비개발자도 이해할 수 있게 1~2문장으로 요약해.
 "빌드에 실패했어요." 로 시작해. 어떤 파일에서 무슨 문제가 있는지 간결하게 설명해.
 기술적 용어는 최소화하고, 해결 방향을 간단히 제시해.`,
-        buildResult.stderr.slice(0, 1000),
-      );
-    } catch {
-      errorSummary = "빌드에 실패했어요. 코드에 오류가 있어 수정이 필요해요.";
-    }
+            buildResult.stderr.slice(0, 1000),
+          );
+        } catch {
+          errorSummary = "빌드에 실패했어요. 코드에 오류가 있어 수정이 필요해요.";
+        }
 
-    await saveMessage({ conversationId, role: "assistant", content: errorSummary, type: "build_failed", metadata: { rawError: buildResult.stderr.slice(0, 500) } });
-    return { type: "build_failed", errorSummary, error: buildResult.stderr.slice(0, 500) };
-  }
-  emit("progress", { step: "build", state: "done" });
-
-  // 빌드 성공 시점을 임시 커밋으로 저장 — 보완 실패 시 여기로 복원
-  await run("git add -A", repoPath);
-  await run('git commit -m "__checkpoint: build passed"', repoPath).catch(() => {});
-
-  // 7. 검증 (빌드 성공 후 — 실제 디스크 상태 기반)
-  const appliedBeforeVerify = [...appliedChanges];
-  for (let v = 1; v <= 2; v++) {
-    const verification = await verifyChanges(message, appliedChanges, repoPath);
-    if (verification.passed) break;
-    if (v >= 2) break;
-
-    console.log(`[VERIFY] 누락 감지, 보완 시도 (${v}/2): ${verification.missing}`);
-    const allPaths = [...new Set([...relevantPaths, ...appliedChanges.map((c) => c.filePath)])];
-    const currentFiles = readFiles(allPaths, repoPath);
-    try {
-      const supplementResult = await generateCodeChanges(
-        `원래 요청: ${message}\n\n누락된 작업: ${verification.missing}\n\n누락된 부분만 추가로 구현해줘.`,
-        currentFiles, figmaData, context, repoPath,
-      );
-      appliedChanges.push(...(supplementResult.appliedChanges || []));
-
-      // 보완 후 빌드 재확인
-      const rebuildResult = await runBuild(repoPath);
-      if (!rebuildResult.success) {
-        console.warn("[VERIFY] 보완 후 빌드 실패 — 체크포인트로 복원");
-        // 보완분만 되돌리기 — 체크포인트 커밋으로 리셋
-        await run("git reset --hard HEAD", repoPath);
-        appliedChanges.length = 0;
-        appliedChanges.push(...appliedBeforeVerify);
-        break;
+        await saveMessage({ conversationId, role: "assistant", content: errorSummary, type: "build_failed", metadata: { rawError: buildResult.stderr.slice(0, 500) } });
+        throw { __earlyReturn: { type: "build_failed", errorSummary, error: buildResult.stderr.slice(0, 500) } };
       }
-    } catch {
-      // 보완 생성 자체 실패 — 원본 유지
-      await run("git reset --hard HEAD", repoPath).catch(() => {});
-      appliedChanges.length = 0;
-      appliedChanges.push(...appliedBeforeVerify);
-      break;
+
+      // 빌드 성공 → 체크포인트 커밋 (검증 실패 시 복원용)
+      await run("git add -A", repoPath);
+      await run('git commit -m "__checkpoint: build passed"', repoPath).catch(() => {});
+    },
+
+    verify: async () => {
+      const appliedBeforeVerify = [...ctx.appliedChanges];
+      let verifyAttempt = 0;
+      let verifyPassed = false;
+      while (!verifyPassed && verifyAttempt < MAX_LOOP) {
+        verifyAttempt++;
+        const verification = await verifyChanges(message, ctx.appliedChanges, repoPath);
+        if (verification.passed) {
+          verifyPassed = true;
+          break;
+        }
+
+        console.log(`[STEP:verify] 누락 감지 (${verifyAttempt}/${MAX_LOOP}): ${verification.missing}`);
+        emit("progress", { step: "verify", state: "retrying", attempt: verifyAttempt, maxAttempt: MAX_LOOP, missing: verification.missing });
+        const allPaths = [...new Set([...ctx.relevantPaths, ...ctx.appliedChanges.map((c) => c.filePath)])];
+        const currentFiles = readFiles(allPaths, repoPath);
+        try {
+          const supplementResult = await generateCodeChanges(
+            `원래 요청: ${message}\n\n누락된 작업: ${verification.missing}\n\n누락된 부분만 추가로 구현해줘.`,
+            currentFiles, ctx.figmaData, ctx.context, repoPath,
+          );
+          ctx.appliedChanges.push(...(supplementResult.appliedChanges || []));
+
+          const rebuildResult = await runBuild(repoPath);
+          if (!rebuildResult.success) {
+            console.warn("[STEP:verify] 보완 후 빌드 실패 — 체크포인트로 복원");
+            await run("git reset --hard HEAD", repoPath);
+            ctx.appliedChanges.length = 0;
+            ctx.appliedChanges.push(...appliedBeforeVerify);
+            break;
+          }
+        } catch {
+          await run("git reset --hard HEAD", repoPath).catch(() => {});
+          ctx.appliedChanges.length = 0;
+          ctx.appliedChanges.push(...appliedBeforeVerify);
+          break;
+        }
+      }
+
+      // 체크포인트 언커밋
+      await run("git reset --soft HEAD~1", repoPath).catch(() => {});
+    },
+
+    push: async () => {
+      const changedFiles = [...new Set(ctx.appliedChanges.map((c) => c.filePath))];
+
+      const gitStatus = await run("git status --porcelain", repoPath).catch(() => "");
+      if (!gitStatus.trim()) {
+        console.warn("[STEP:push] 변경사항 없음 — 커밋 스킵");
+        await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
+        await saveMessage({ conversationId, role: "assistant", content: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", type: "no_changes" });
+        throw { __earlyReturn: { type: "no_changes", message: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", threadId } };
+      }
+
+      try {
+        await run(`git add ${changedFiles.map((f) => `"${f}"`).join(" ")}`, repoPath);
+      } catch {
+        await run("git add -A", repoPath);
+      }
+
+      let commitMsg;
+      try {
+        commitMsg = await callHaiku(
+          `너는 git 커밋 메시지 생성기야. design: 접두사로 시작하는 한국어 커밋 메시지를 한 줄로 작성해. 50자 이내. 커밋 메시지만 출력해.`,
+          `요청: ${message}\n수정된 파일: ${changedFiles.join(", ")}`,
+        );
+        commitMsg = commitMsg.trim().replace(/"/g, '\\"');
+      } catch {
+        commitMsg = `design: ${message.slice(0, 50).replace(/"/g, '\\"')}`;
+      }
+      await run(`git commit -m "${commitMsg}"`, repoPath);
+      await run(`git push origin ${ctx.branchName}`, repoPath);
+      ctx.pushTimestamp = Date.now();
+
+      // 스레드 데이터 업데이트
+      const threadData = threadBranchMap.get(threadId);
+      threadData.hasCommit = true;
+      threadData.changes.push(
+        ctx.appliedChanges.map((c) => `${c.type}: ${c.filePath}`).join("\n").slice(0, 500),
+      );
+      saveThreadMap(threadBranchMap);
+    },
+
+    deploy: async () => {
+      const previewUrl = await waitForVercelDeployment(ctx.branchName, ctx.pushTimestamp);
+      ctx.previewUrl = previewUrl;
+    },
+  };
+
+  // ── 3. 계획 실행 루프 ──
+  const totalSteps = plan.steps.length;
+  try {
+    for (let i = 0; i < totalSteps; i++) {
+      const step = plan.steps[i];
+      const handler = stepHandlers[step];
+      if (!handler) {
+        console.warn(`[PLAN] 알 수 없는 단계: ${step}, 스킵`);
+        continue;
+      }
+
+      emit("progress", { step, state: "start", current: i + 1, total: totalSteps });
+      await handler();
+      emit("progress", { step, state: "done", current: i + 1, total: totalSteps });
     }
+  } catch (err) {
+    if (err.__earlyReturn) return err.__earlyReturn;
+    throw err;
   }
 
-  // 체크포인트 커밋을 언커밋 (변경사항은 유지, 커밋만 제거 — 나중에 진짜 커밋으로 교체)
-  await run("git reset --soft HEAD~1", repoPath).catch(() => {});
-
-  // 9. git push
-  emit("progress", { step: "push", state: "start" });
-  const changedFiles = [...new Set(appliedChanges.map((c) => c.filePath))];
-
-  // 변경사항 없으면 커밋 스킵
-  const gitStatus = await run("git status --porcelain", repoPath).catch(() => "");
-  if (!gitStatus.trim()) {
-    console.warn("[GIT] 변경사항 없음 — 커밋 스킵");
-    emit("progress", { step: "push", state: "done" });
-    await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
-    await saveMessage({ conversationId, role: "assistant", content: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", type: "no_changes" });
-    return { type: "no_changes", message: "코드를 수정했지만 최종 반영할 변경사항이 없었어요.", threadId };
-  }
-
-  try {
-    await run(`git add ${changedFiles.map((f) => `"${f}"`).join(" ")}`, repoPath);
-  } catch {
-    await run("git add -A", repoPath);
-  }
-
-  let commitMsg;
-  try {
-    commitMsg = await callHaiku(
-      `너는 git 커밋 메시지 생성기야. design: 접두사로 시작하는 한국어 커밋 메시지를 한 줄로 작성해. 50자 이내. 커밋 메시지만 출력해.`,
-      `요청: ${message}\n수정된 파일: ${changedFiles.join(", ")}`,
-    );
-    commitMsg = commitMsg.trim().replace(/"/g, '\\"');
-  } catch {
-    commitMsg = `design: ${message.slice(0, 50).replace(/"/g, '\\"')}`;
-  }
-  await run(`git commit -m "${commitMsg}"`, repoPath);
-  await run(`git push origin ${branchName}`, repoPath);
-  const pushTimestamp = Date.now();
-  emit("progress", { step: "push", state: "done" });
-
-  // 10. 스레드 데이터 업데이트
-  threadData.hasCommit = true;
-  threadData.changes.push(
-    appliedChanges.map((c) => `${c.type}: ${c.filePath}`).join("\n").slice(0, 500),
-  );
-  saveThreadMap(threadBranchMap);
-
-  // 11. Vercel 배포 대기
-  emit("progress", { step: "deploy", state: "start" });
-  const previewUrl = await waitForVercelDeployment(branchName, pushTimestamp);
-  emit("progress", { step: "deploy", state: "done", previewUrl });
-
-  // 12. 변경 요약
-  const changeSummary = appliedChanges
+  // ── 4. 변경 요약 + DB 저장 ──
+  const changedFiles = [...new Set(ctx.appliedChanges.map((c) => c.filePath))];
+  const changeSummary = ctx.appliedChanges
     .map((c) => {
       if (c.type === "create") return `생성: ${c.filePath}\n미리보기: ${(c.content || "").slice(0, 200)}`;
       return `수정: ${c.filePath}\n이전: ${(c.oldString || "").slice(0, 100)}\n이후: ${(c.newString || "").slice(0, 100)}`;
@@ -517,10 +579,9 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
 
   await run(`git checkout ${CONFIG.repo.branch}`).catch(() => {});
 
-  // DB: 성공 결과 저장 + 대화 메타데이터 업데이트
-  const resultData = { type: "success", summary, branchName, previewUrl, changedFiles, threadId };
-  await saveMessage({ conversationId, role: "assistant", content: summary, type: "success", metadata: { branchName, previewUrl, changedFiles } });
-  await updateConversation(conversationId, { branch_name: branchName });
+  const resultData = { type: "success", summary, branchName: ctx.branchName, previewUrl: ctx.previewUrl, changedFiles, threadId };
+  await saveMessage({ conversationId, role: "assistant", content: summary, type: "success", metadata: { branchName: ctx.branchName, previewUrl: ctx.previewUrl, changedFiles } });
+  await updateConversation(conversationId, { branch_name: ctx.branchName });
 
   return resultData;
 }

@@ -93,36 +93,51 @@ async function summarizeChanges(claudeOutput) {
   }
 }
 
-const VERIFY_SYSTEM = `너는 코드 수정 검증기야. 사용자의 요청과 실제 변경 내역을 비교해서 누락된 작업이 있는지 확인해.
+const VERIFY_SYSTEM = `너는 코드 수정 검증기야. 사용자의 요청과 실제 코드를 비교해서 누락된 작업이 있는지 확인해.
 
-## 규칙
-- 사용자 요청에 포함된 모든 작업이 변경 내역에 반영되었는지 확인해
-- 누락된 게 없으면 "PASS"만 출력해
-- 누락된 게 있으면 "FAIL: " 뒤에 누락된 작업을 구체적으로 나열해
-- "PASS" 또는 "FAIL: ..." 외에 다른 말은 하지 마
+## 출력 형식
+- 누락 없음 → "PASS" 한 단어만 출력
+- 누락 있음 → "FAIL: [구체적으로 뭘 해야 하는지]" 출력
+- PASS/FAIL 외에 다른 말은 하지 마
 
-## 체크포인트
-- 새 페이지 생성 요청 → page.tsx가 있는가?
-- 컴포넌트 생성 → 해당 컴포넌트 파일이 있는가?
-- 헤더/네비게이션 연결 요청 → Header 등 네비게이션 파일이 수정되었는가?
-- 기존 파일 수정 요청 → 해당 파일의 edit가 있는가?
-- import한 모듈 → 해당 파일이 생성/존재하는가?
-- ⚠️ 새 콘텐츠/페이지/섹션을 만들었으면 → 사용자가 실제로 볼 수 있는가? (라우팅, 네비게이션 링크, 기존 페이지에 import 등). 파일만 만들고 어디에도 연결하지 않았으면 FAIL
-- ⚠️ 새 섹션/컴포넌트를 만들었으면 → 기존 페이지에서 렌더링하고 있는가? 단순히 파일 생성만으로는 사용자에게 보이지 않음
-- ⚠️ 새 UI 요소(버튼, 링크 등)를 추가했는데 prop 기본값이 false/hidden이면 → 실제로 보이지 않으므로 FAIL. 사용자가 "보이게 해달라"고 한 건 기본적으로 보여야 함
-- ⚠️ 코드 미리보기에서 default 값, 조건부 렌더링(&&, 삼항) 등을 확인해서 실제로 사용자에게 보이는지 검증
+## 검증 기준
+
+### 새로 만드는 경우
+- 새 페이지 → page.tsx가 있는가?
+- 새 컴포넌트 → 파일이 존재하고, 기존 페이지에서 import + 렌더링하고 있는가?
+- 네비게이션 연결 요청 → Header/Nav 파일이 실제로 수정되었는가?
+- import한 모듈 → 해당 파일이 존재하는가?
+
+### 기존 수정하는 경우
+- 스타일 변경 (크기, 색상, 여백 등) → 코드에 요청한 값이 반영되었는가?
+- 텍스트 변경 → 해당 텍스트가 코드에 있는가?
+- 삭제 요청 → 해당 요소가 코드에서 제거되었는가?
+
+### 공통 (가장 중요)
+- ⚠️ 새로 만든 건 사용자에게 보여야 한다. 파일만 만들고 어디에도 연결 안 했으면 FAIL
+- ⚠️ prop 기본값이 false/hidden이면 실제로 안 보임 → FAIL
+- ⚠️ 조건부 렌더링(&&, 삼항)으로 기본 숨김 처리되어 있으면 → FAIL
+
+## FAIL 작성 규칙
+- 뭐가 누락됐는지 + 어떻게 해야 하는지 구체적으로 써라
+- 나쁜 예: "FAIL: 헤더 수정 안 됨"
+- 좋은 예: "FAIL: Header 컴포넌트에 /fortune 페이지로 이동하는 링크를 추가해야 함"
 
 ## 예시
 요청: "만우절 콘텐츠 넣어줘"
 변경: 생성 src/components/AprilFools/index.tsx
-→ FAIL: AprilFools 컴포넌트를 만들었지만 기존 페이지에서 import하여 렌더링하지 않아 사용자에게 보이지 않음
+→ FAIL: AprilFools 컴포넌트를 기존 페이지(page.tsx)에서 import하고 렌더링해야 사용자에게 보임
 
 요청: "운세 페이지 만들고 헤더에 버튼 연결해줘"
-변경: 생성 src/app/fortune/page.tsx, 생성 src/components/Sections/FortuneSection/index.tsx
-→ FAIL: 헤더에 운세 페이지 이동 버튼이 추가되지 않음
+변경: 생성 src/app/fortune/page.tsx, 생성 FortuneSection/index.tsx
+→ FAIL: Header 컴포넌트에 /fortune 경로로 이동하는 버튼/링크를 추가해야 함
 
 요청: "Section3 타이틀 크기 키워줘"
-변경: 수정 src/components/Sections/Section3/index.tsx
+변경: 수정 Section3/index.tsx (text-2xl → text-4xl)
+→ PASS
+
+요청: "버튼 색상 빨간색으로 바꿔줘"
+변경: 수정 Button/index.tsx (bg-primary → bg-red-500)
 → PASS`;
 
 /**

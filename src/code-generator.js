@@ -64,11 +64,6 @@ const TOOLS = [
 function buildUserMessage(request, fileContents, figmaData, context) {
   let msg = "";
 
-  // 코드베이스 컨텍스트 — tailwind config, 기존 컴포넌트 목록
-  if (context?.codebaseContext) {
-    msg += `## 코드베이스 컨텍스트\n${context.codebaseContext}\n\n---\n\n`;
-  }
-
   if (context?.threadHistory) {
     msg += `## 대화 맥락\n${context.threadHistory}\n\n---\n\n`;
   }
@@ -84,10 +79,7 @@ function buildUserMessage(request, fileContents, figmaData, context) {
   msg += `## 디자이너 요청\n${request}\n\n`;
 
   if (figmaData) {
-    msg += `## 피그마 디자인 스펙 (구조 데이터)\n\`\`\`json\n${JSON.stringify(figmaData.specs, null, 2)}\n\`\`\`\n\n`;
-    if (figmaData.screenshots?.length > 0) {
-      msg += `## 참고: 위 스펙과 함께 피그마 스크린샷 이미지가 첨부되어 있음. 스크린샷을 보고 시각적으로 동일하게 구현해.\n\n`;
-    }
+    msg += `## 피그마 디자인 분석 결과\n\`\`\`json\n${JSON.stringify(figmaData.specs, null, 2)}\n\`\`\`\n\n`;
   }
 
   // 파일 내용 — 토큰 예산 체크하면서 추가
@@ -169,22 +161,18 @@ async function generateCodeChanges(
   context,
   repoPath,
 ) {
-  const MAX_READBACKS = 5;
+  const MAX_READBACKS = 10;
   const appliedChanges = [];
   const failedChanges = [];
 
   const userMessage = buildUserMessage(request, fileContents, figmaData, context);
 
-  // 이미지(유저 첨부 + 피그마 스크린샷)가 있으면 multimodal content 구성
-  const allImages = [
-    ...(figmaData?.screenshots || []),
-    ...(context?.images || []),
-  ];
-
+  // 이미지가 있으면 multimodal content 구성
   let firstMessageContent;
-  if (allImages.length > 0) {
+  if (context?.images && context.images.length > 0) {
     firstMessageContent = [];
-    for (const img of allImages) {
+    // 이미지 먼저
+    for (const img of context.images) {
       firstMessageContent.push({
         type: "image",
         source: {
@@ -194,6 +182,7 @@ async function generateCodeChanges(
         },
       });
     }
+    // 텍스트 뒤에
     firstMessageContent.push({ type: "text", text: userMessage });
   } else {
     firstMessageContent = userMessage;
