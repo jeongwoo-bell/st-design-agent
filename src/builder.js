@@ -64,8 +64,10 @@ async function applyChanges(changes, repoPath) {
 /**
  * pnpm build 실행
  */
-async function runBuild(repoPath) {
+async function runBuild(repoPath, emit) {
+  const _emit = typeof emit === "function" ? emit : () => {};
   console.log("[BUILDER] pnpm build 실행 중...");
+  _emit("log", { step: "build", message: "pnpm build 실행 중..." });
   try {
     const { stdout, stderr } = await execAsync("pnpm build", {
       cwd: repoPath,
@@ -73,9 +75,11 @@ async function runBuild(repoPath) {
       maxBuffer: 10 * 1024 * 1024,
     });
     console.log("[BUILDER] 빌드 성공");
+    _emit("log", { step: "build", message: "빌드 성공" });
     return { success: true, stdout, stderr };
   } catch (err) {
     console.error("[BUILDER] 빌드 실패:", err.stderr?.slice(0, 300) || err.message);
+    _emit("log", { step: "build", message: "빌드 실패" });
     return {
       success: false,
       stdout: err.stdout || "",

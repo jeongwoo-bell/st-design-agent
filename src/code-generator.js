@@ -160,8 +160,10 @@ async function generateCodeChanges(
   figmaData,
   context,
   repoPath,
+  emit,
 ) {
-  const MAX_READBACKS = 5;
+  const _emit = typeof emit === "function" ? emit : () => {};
+  const MAX_READBACKS = 10;
   const appliedChanges = [];
   const failedChanges = [];
 
@@ -225,6 +227,7 @@ async function generateCodeChanges(
           content: "적용 완료",
         });
         console.log(`[CODE-GEN] ✅ 적용 성공: ${change.filePath}`);
+        _emit("log", { step: "generate_code", message: `${change.filePath} 수정 완료` });
       } else {
         failedChanges.push(change);
         const reason = result.failed[0]?.reason || "알 수 없는 오류";
@@ -235,6 +238,7 @@ async function generateCodeChanges(
           is_error: true,
         });
         console.log(`[CODE-GEN] ❌ 적용 실패: ${change.filePath} — ${reason}`);
+        _emit("log", { step: "generate_code", message: `${change.filePath} 재시도 중` });
       }
     }
 
@@ -245,6 +249,7 @@ async function generateCodeChanges(
       try {
         fileContent = fs.readFileSync(absPath, "utf-8");
         console.log(`[CODE-GEN] 📖 추가 파일 읽기: ${req.filePath}`);
+        _emit("log", { step: "generate_code", message: `${req.filePath} 분석 중` });
       } catch (err) {
         fileContent = `파일을 읽을 수 없습니다: ${err.message}`;
         console.warn(`[CODE-GEN] 추가 파일 읽기 실패: ${req.filePath}`);
@@ -270,7 +275,7 @@ async function generateCodeChanges(
 /**
  * 빌드 에러 수정 요청
  */
-async function fixBuildError(errorMessage, fileContents, repoPath) {
+async function fixBuildError(errorMessage, fileContents, repoPath, emit) {
   const request = `빌드 에러가 발생했어. 에러를 수정해줘.
 
 ## 빌드 에러 메시지
@@ -278,7 +283,7 @@ async function fixBuildError(errorMessage, fileContents, repoPath) {
 ${errorMessage}
 \`\`\``;
 
-  return generateCodeChanges(request, fileContents, null, null, repoPath);
+  return generateCodeChanges(request, fileContents, null, null, repoPath, emit);
 }
 
 module.exports = { generateCodeChanges, fixBuildError, TOOLS };
