@@ -161,14 +161,48 @@ function rgbaToHex(color, opacity = 1) {
 }
 
 /**
- * 메시지에서 피그마 링크를 감지하고 디자인 데이터를 가져옴
- * @returns {object|null} { specs, rawData } 또는 null
+ * 피그마 노드의 스크린샷(PNG) 가져오기 → base64
+ */
+async function getFigmaScreenshot(fileKey, nodeId) {
+  if (!CONFIG.figma.apiKey) return null;
+
+  try {
+    // 1. 이미지 URL 요청
+    const url = `${FIGMA_API_BASE}/images/${fileKey}?ids=${encodeURIComponent(nodeId)}&format=png&scale=2`;
+    const res = await fetch(url, {
+      headers: { "X-Figma-Token": CONFIG.figma.apiKey },
+    });
+    if (!res.ok) throw new Error(`${res.status}`);
+
+    const data = await res.json();
+    const imageUrl = data.images?.[nodeId];
+    if (!imageUrl) throw new Error("이미지 URL 없음");
+
+    // 2. 이미지 다운로드 → base64
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) throw new Error(`이미지 다운로드 실패: ${imgRes.status}`);
+
+    const buffer = Buffer.from(await imgRes.arrayBuffer());
+    const base64 = buffer.toString("base64");
+    console.log(`[FIGMA] 스크린샷 다운로드 완료 (${Math.round(buffer.length / 1024)}KB)`);
+
+    return { base64, mediaType: "image/png" };
+  } catch (err) {
+    console.warn(`[FIGMA] 스크린샷 가져오기 실패: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * 메시지에서 피그마 링크를 감지하고 디자인 데이터 + 스크린샷을 가져옴
+ * @returns {object|null} { specs, screenshots } 또는 null
  */
 async function fetchFigmaData(message) {
   const urls = extractFigmaUrls(message);
   if (urls.length === 0) return null;
 
   const allSpecs = [];
+  const screenshots = [];
 
   for (const url of urls) {
     const parsed = parseFigmaUrl(url);
@@ -179,7 +213,13 @@ async function fetchFigmaData(message) {
 
     try {
       console.log(`[FIGMA] 데이터 가져오는 중: ${parsed.fileKey} / ${parsed.nodeId}`);
-      const data = await getFigmaNodeData(parsed.fileKey, parsed.nodeId);
+
+      // 스펙 + 스크린샷 동시 요청
+      const [data, screenshot] = await Promise.all([
+        getFigmaNodeData(parsed.fileKey, parsed.nodeId),
+        getFigmaScreenshot(parsed.fileKey, parsed.nodeId),
+      ]);
+
       const nodes = data.nodes || {};
       for (const nodeId of Object.keys(nodes)) {
         const node = nodes[nodeId]?.document;
@@ -188,13 +228,15 @@ async function fetchFigmaData(message) {
           allSpecs.push(...specs);
         }
       }
+
+      if (screenshot) screenshots.push(screenshot);
     } catch (err) {
       console.error(`[FIGMA] 데이터 가져오기 실패: ${err.message}`);
     }
   }
 
-  if (allSpecs.length === 0) return null;
-  return { specs: allSpecs };
+  if (allSpecs.length === 0 && screenshots.length === 0) return null;
+  return { specs: allSpecs, screenshots };
 }
 
 module.exports = {

@@ -320,6 +320,33 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
   // 5. 코드 생성 (멀티턴 중 즉시 디스크 적용됨)
   emit("progress", { step: "codegen", state: "start" });
   const threadData = threadBranchMap.get(threadId);
+
+  // 코드베이스 컨텍스트 — tailwind config, 기존 컴포넌트 목록
+  let codebaseContext = "";
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    // tailwind config
+    for (const configName of ["tailwind.config.ts", "tailwind.config.js"]) {
+      const configPath = path.join(repoPath, configName);
+      if (fs.existsSync(configPath)) {
+        const configContent = fs.readFileSync(configPath, "utf-8");
+        codebaseContext += `### ${configName} (커스텀 색상/토큰 참고)\n\`\`\`\n${configContent.slice(0, 3000)}\n\`\`\`\n\n`;
+        break;
+      }
+    }
+    // 기존 컴포넌트 목록
+    const componentsDir = path.join(repoPath, "src/components");
+    if (fs.existsSync(componentsDir)) {
+      const components = fs.readdirSync(componentsDir, { recursive: true })
+        .filter((f) => f.endsWith("index.tsx"))
+        .map((f) => `src/components/${f}`);
+      if (components.length > 0) {
+        codebaseContext += `### 기존 컴포넌트 (재사용 가능)\n${components.join("\n")}\n\n`;
+      }
+    }
+  } catch {}
+
   const context = {
     isFollowUp,
     isFirstCommit: !threadData.hasCommit,
@@ -327,6 +354,7 @@ async function _processCodeRequest({ message, threadId, userName, threadHistory,
     threadHistory,
     docsContext: docsResult?.docsContext || null,
     images,
+    codebaseContext: codebaseContext || null,
   };
 
   let codeResult;
