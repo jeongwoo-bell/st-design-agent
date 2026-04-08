@@ -101,10 +101,20 @@ async function _planSteps({ message, hasImages, hasFigma, hasDocs, isFollowUp })
 async function handleRequest(params, emit) {
   let _convId = null;
   try {
-    return await _handleRequestInner(params, emit, (id) => { _convId = id; });
-  } finally {
-    // 어떤 경로든 처리 완료 시 processing 해제
-    if (_convId) await updateProcessingStatus(_convId, null);
+    const result = await _handleRequestInner(params, emit, (id) => { _convId = id; });
+    // 성공 시 완료 상태 저장 (5분 후 자동 정리)
+    if (_convId) {
+      await updateProcessingStatus(_convId, { processing: false, completed: true, type: result?.type || "success" });
+      setTimeout(() => updateProcessingStatus(_convId, null).catch(() => {}), 300000);
+    }
+    return result;
+  } catch (err) {
+    // 에러 시 에러 상태 저장
+    if (_convId) {
+      await updateProcessingStatus(_convId, { processing: false, error: true, message: err.message?.slice(0, 300) });
+      setTimeout(() => updateProcessingStatus(_convId, null).catch(() => {}), 300000);
+    }
+    throw err;
   }
 }
 
